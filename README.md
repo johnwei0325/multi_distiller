@@ -1,4 +1,4 @@
-## Step 0) **Warning**
+## Step 0) ⚠️ Warning !!
 If you want to execute this project, there will some problems, this repo isn't complete currently.
 If there is any questions, please check here: https://github.com/s3prl/s3prl/tree/main/s3prl/pretrain
 
