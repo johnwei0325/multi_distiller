@@ -23,6 +23,6 @@ pretrain_expert:
     num_workers: 24
     train_batch_size: 4
     max_timestep: 0
-    libri_root: /work/harry87122/dataset/LibriSpeech/
+    libri_root: /4TB/johnwei/ssl_project/dataset/LibriSpeech/
     file_path: /4TB/johnwei/ssl_project/s3prl/s3prl/data/len_for_bucket
     sets: ['train-clean-100', 'train-clean-360', 'train-other-500']

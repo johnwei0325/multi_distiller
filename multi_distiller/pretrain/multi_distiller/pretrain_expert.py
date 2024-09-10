@@ -18,7 +18,7 @@ from transformers import ASTForAudioClassification
 from transformers import AutoProcessor, ASTModel
 
 
-from audiossl.models.atst.atst import ATST
+# from audiossl.models.atst.atst import ATST
 # from ......MERT.mert_fairseq.models.mert.mert_model import MERTConfig
 
 def freeze_model(model):

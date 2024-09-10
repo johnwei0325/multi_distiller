@@ -1,0 +1,10 @@
+setup.py
+requirements/all.txt
+requirements/dev.txt
+requirements/install.txt
+s3prl.egg-info/PKG-INFO
+s3prl.egg-info/SOURCES.txt
+s3prl.egg-info/dependency_links.txt
+s3prl.egg-info/entry_points.txt
+s3prl.egg-info/requires.txt
+s3prl.egg-info/top_level.txt
