@@ -2,7 +2,18 @@
 If you want to execute this project, there will some problems, this repo isn't complete currently.
 If there is any questions, please check here: https://github.com/s3prl/s3prl/tree/main/s3prl/pretrain
 
-## Step 1) Prepare data
+## Step 1) Set up
+```bash
+git clone https://github.com/johnwei0325/multi_distiller.git
+```
+```bash
+cd multi_distiller
+```
+```bash
+pip install -e .
+```
+
+## Step 2) Prepare data
 1) Download the LibriSpeech raw data from [here](http://www.openslr.org/12).
     - These sets are used for pretraining:
         - train-clean-100 [6.3G]
@@ -15,7 +26,7 @@ If there is any questions, please check here: https://github.com/s3prl/s3prl/tre
 python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/LibriSpeech/
 ```
 
-## Step 2) Modifiy runner config
+## Step 3) Modifiy runner config
 1) Open `S3PRL/pretrain/tera/config_runner.yaml`:
     - This is the default runner config of tera, and it will be taken by default if not specified otherwise.
     - To assign another config other then default, you can use the `-c` argument, for example:
@@ -42,7 +53,7 @@ python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/LibriSpeech/
     - Modify the `sets` list to choose pretraining subsets.
 
     
-## Step 3) Start training
+## Step 4) Start training
 ### Distiller
 - Command:
 ```bash
