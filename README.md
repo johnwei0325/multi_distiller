@@ -14,6 +14,7 @@ pip install -e .
 ```
 
 ## Step 2) Prepare data
+### LibriSpeech
 1) Download the LibriSpeech raw data from [here](http://www.openslr.org/12).
     - These sets are used for pretraining:
         - train-clean-100 [6.3G]
@@ -25,6 +26,11 @@ pip install -e .
 ```bash
 python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/LibriSpeech/
 ```
+### AudioSet
+1) Download AdusioSet data from [here](https://www.kaggle.com/datasets/zfturbo/audioset).
+
+### Music4all
+1) Get data access from [here](https://sites.google.com/view/contact4music4all).
 
 ## Step 3) Modifiy runner config
 1) Open `S3PRL/pretrain/tera/config_runner.yaml`:
