@@ -22,7 +22,7 @@ pip install -e .
         - train-other-500 [30G]
     - The LibriSpeech directory after download and unzip should look like this: 
       ![](https://i.imgur.com/PdAOXjq.png)
-2) **(IMPORTANT)** Generate the meta data directory `len_for_bucket/` for bucketing to accelerate training: 
+2) Generate meta data directory `len_for_bucket/` for bucketing to accelerate training: 
 ```bash
 python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/LibriSpeech/
 ```
@@ -48,7 +48,7 @@ python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/music4all/
 ```
 ### meta data for mixed dataset
 ```bash
-python3 dataset_preprocess/combine_dataset.py PATH_TO_YOUR/music4all/
+python3 dataset_preprocess/combine_csv.py --csv1 --csv2 --csv3 --output --sample_size
 ```
 
 ## Step 3) Modifiy runner config
