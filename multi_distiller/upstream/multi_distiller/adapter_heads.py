@@ -81,6 +81,18 @@ class LightConvAdapterHead(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((self.target_length, source_channel_size)),  # Resize to target length
         )
+        
+        self.adapter.register_full_backward_hook(self.grad_divide_hook)
+        self.length_adjuster.register_full_backward_hook(self.grad_divide_hook)
+        
+    def grad_divide_hook(self, module, grad_input, grad_output):
+        """Hook function to divide the gradient by a factor (e.g., 5)."""
+        factor = 5  # The factor by which to divide the gradients
+        # Make sure the number of grad_input elements matches exactly what is expected
+        if len(grad_input) == 1:  # Typically for nn.Linear
+            return (grad_input[0] / factor,)  # Return as a single-element tuple
+        else:
+            return tuple(grad / factor if grad is not None else None for grad in grad_input)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for LightConvAdapterHead.

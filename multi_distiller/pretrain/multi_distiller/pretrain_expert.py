@@ -135,6 +135,46 @@ def disable_MERT_encoder_dropout(model):
     print("[MERT] - Disabled all dropouts in the encoder's layers by setting p=0.0 where applicable")
 
 
+def disable_AST_encoder_dropout(model):
+    """Disable all dropouts in the encoder layers of the ASTModel by setting their probabilities to 0.0."""
+
+    # Disable encoder layer dropout if available in config
+    if hasattr(model.config, 'encoder_layerdrop'):
+        model.config.encoder_layerdrop = 0.0  # Set encoder layer dropout to 0
+
+    # Iterate through all encoder layers and disable their dropouts by setting p=0.0
+    for layer in model.encoder.layer:  # Access each ASTLayer in the encoder
+        # Disable attention dropout within ASTAttention
+        if hasattr(layer, 'attention') and hasattr(layer.attention, 'attention'):
+            attention = layer.attention.attention
+            if hasattr(attention, 'dropout') and isinstance(attention.dropout, nn.Dropout):
+                attention.dropout.p = 0.0  # Set attention dropout to 0.0
+
+        # Disable output dropout within ASTSelfOutput
+        if hasattr(layer, 'attention') and hasattr(layer.attention, 'output'):
+            output = layer.attention.output
+            if hasattr(output, 'dropout') and isinstance(output.dropout, nn.Dropout):
+                output.dropout.p = 0.0  # Set output dropout to 0.0
+
+        # Disable intermediate dropout within ASTIntermediate
+        if hasattr(layer, 'intermediate'):
+            intermediate = layer.intermediate
+            if hasattr(intermediate, 'intermediate_act_fn'):
+                act_fn = intermediate.intermediate_act_fn
+                if isinstance(act_fn, nn.Dropout):
+                    act_fn.p = 0.0  # Set intermediate activation dropout to 0.0
+
+        # Disable output dropout within ASTOutput
+        if hasattr(layer, 'output'):
+            output = layer.output
+            if hasattr(output, 'dropout') and isinstance(output.dropout, nn.Dropout):
+                output.dropout.p = 0.0  # Set output dropout to 0.0
+
+        # Disable any general dropout in the layer if applicable
+        if hasattr(layer, 'dropout') and isinstance(layer.dropout, nn.Dropout):
+            layer.dropout.p = 0.0
+
+    print("[AST] - Disabled all dropouts in the encoder's layers by setting p=0.0 where applicable")
 
 class UpstreamPretrainExpert(nn.Module):
     """
@@ -293,72 +333,51 @@ class UpstreamPretrainExpert(nn.Module):
 
 class MultiDistillerForPretrain(nn.Module):
     """
-    Distiller for pretraining
+    Distiller for pretraining with flexible number of teacher models.
     """
 
     def __init__(self, config: MultiDistillerConfig, teacher_config: edict):
         super().__init__()
         self.config = config
         self.distiller = MultiDistillerModel(config)
-
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.teacher_config = teacher_config
-        self.teachers = teacher_config.models
-        teacher_1 = torch.hub.load("s3prl/s3prl", self.teachers.model_1)
-        if(self.teachers.model_2 == 'mert_v0_public'):
-            # teacher_2 = AutoModel.from_pretrained("m-a-p/MERT-v0-public", trust_remote_code=True)
-            temp_config = AutoConfig.from_pretrained("m-a-p/MERT-v0-public", trust_remote_code=True)
-            temp_config.output_hidden_states = True  # Enable hidden states in the output
-            teacher_2 = AutoModel.from_pretrained("m-a-p/MERT-v0-public", config=temp_config, trust_remote_code=True)
-            disable_MERT_encoder_dropout(teacher_2)
-        if(self.teachers.model_3 == 'ast'):
-        #     atst_model_path = '/4TB/johnwei/ssl_project/teacher_models/atst_base.ckpt'
-        #     target_device = torch.device('cuda:1')
-        #     teacher_3 = get_ATST_teacher_model("base", 2, atst_model_path, target_device)
-            temp_config = AutoConfig.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-            temp_config.output_hidden_states = True  # Enable output of hidden states
+        self.teachers = teacher_config.models  # Expecting a list of teacher model names
 
-            teacher_3 = ASTModel.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593", config=temp_config)
-            teacher_3_processor = AutoProcessor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+        # Dictionary to store teacher models and processors
+        self.teacher_models = {}
+        self.teacher_processors = {}
 
-            # teacher_3 = ASTModel.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+        # Load teacher models based on self.teachers
+        for model_name in self.teachers:
+            if model_name == 'hubert_base':
+                teacher_1 = torch.hub.load("s3prl/s3prl",model_name).to(device)
+                if model_name.find("hubert") >= 0 or model_name.find("wav2vec2") >= 0:
+                    teacher_1.model.encoder.layerdrop = 0
+                    print("[HuBERT] - Disabled all dropouts in the encoder's blocks")
+                self.teacher_models[model_name] = teacher_1
+            elif model_name == 'mert_v0_public':
+                temp_config = AutoConfig.from_pretrained("m-a-p/MERT-v0-public", trust_remote_code=True)
+                temp_config.output_hidden_states = True  # Enable hidden states in the output
+                teacher_2 = AutoModel.from_pretrained("m-a-p/MERT-v0-public", config=temp_config, trust_remote_code=True).to(device)
+                disable_MERT_encoder_dropout(teacher_2)
+                self.teacher_models[model_name] = teacher_2
+            elif model_name == 'ast':
+                temp_config = AutoConfig.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+                temp_config.output_hidden_states = True  # Enable output of hidden states
+                teacher_3 = ASTModel.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593", config=temp_config).to(device)
+                teacher_3_processor = AutoProcessor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+                disable_AST_encoder_dropout(teacher_3)
+                self.teacher_models[model_name] = teacher_3
+                self.teacher_processors[model_name] = teacher_3_processor
+            else:
+                print(f"Warning: Unknown teacher model {model_name} specified.")
 
+        # Freeze all teacher models
+        for teacher in self.teacher_models.values():
+            freeze_model(teacher)
 
-
-        if (
-            self.teachers.model_1.find("hubert") >= 0
-            or self.teachers.model_1.find("wav2vec2") >= 0
-        ):
-            teacher_1.model.encoder.layerdrop = 0
-            print("[HuBERT] - Disabled all dropouts in the encoder's blocks")
-        assert self.distiller.n_tasks <= teacher_config.n_layers, (
-            self.distiller.n_tasks,
-            teacher_config.n_layers,
-        )
-
-        self.teacher_1 = teacher_1
-        self.teacher_2 = teacher_2
-        self.teacher_3 = teacher_3
-        self.teacher_3_processor = teacher_3_processor
-        freeze_model(self.teacher_1)
-        freeze_model(self.teacher_2)
-        # freeze_model(teacher_3.teacher)
-        # freeze_model(teacher_3.student)
-        freeze_model(self.teacher_3)
-
-        # self.mel_spectrogram_transform = transforms.MelSpectrogram(
-        #     sample_rate=16000,  # Set the sample rate of your waveforms
-        #     n_fft=400,          # Number of FFT components
-        #     win_length=400,     # Window size
-        #     hop_length=160,     # Hop length between frames
-        #     n_mels=64           # Number of Mel bands
-        # )
-
-        print(
-            "[DistillerForPretrain] - Using {} as teacher with {} layers".format(
-                self.teachers, teacher_config.n_layers
-            )
-        )
-
+        # Initialize loss function
         if config.loss_type == "l1":
             self.loss_func = nn.L1Loss(reduction="none")
         elif config.loss_type == "l2":
@@ -371,32 +390,23 @@ class MultiDistillerForPretrain(nn.Module):
             print("[DistillerForPretrain] - Enabled cosine similarity loss.")
 
         if config.init_teacher_conv_layers:
-            print(
-                "[DistillerForPretrain] - "
-                "Initializing feature extractor from teacher"
-            )
+            print("[DistillerForPretrain] - Initializing feature extractor from teacher")
             self.distiller.feature_extractor.load_state_dict(
-                self.teacher_1.model.feature_extractor.state_dict()
+                self.teacher_models['hubert_base'].model.feature_extractor.state_dict()
             )
-            # self.distiller.feature_extractor.load_state_dict(
-            #     self.teacher_2.feature_extractor_cqt.state_dict()
-            # )
-            # self.distiller.feature_extractor.load_state_dict(
-            #     self.teacher_3.teacher.feature_extractor.state_dict()
-            # )
             if self.distiller.post_extract_proj is not None:
                 self.distiller.post_extract_proj.load_state_dict(
-                    self.teacher_1.model.post_extract_proj.state_dict()
+                    self.teacher_models['hubert_base'].model.post_extract_proj.state_dict()
                 )
 
         if config.init_teacher_encoder_layers:
-            print("[DistillerForPretrain] - " "Initializing encoder from teacher")
+            print("[DistillerForPretrain] - Initializing encoder from teacher")
             self.distiller.encoder.pos_conv.load_state_dict(
-                self.teacher_1.model.encoder.pos_conv.state_dict()
+                self.teacher_models['hubert_base'].model.encoder.pos_conv.state_dict()
             )
             for l in range(config.encoder_layers):
                 self.distiller.encoder.layers[l].load_state_dict(
-                    self.teacher_1.model.encoder.layers[l].state_dict()
+                    self.teacher_models['hubert_base'].model.encoder.layers[l].state_dict()
                 )
 
     def forward(
@@ -409,108 +419,44 @@ class MultiDistillerForPretrain(nn.Module):
     ):
         """
         Forward function.
-        Input:
-            wave_input: FloatTensor (B x T_wave)
-            wave_orig: List of FloatTensor
-            wave_len: LongTensor (B)
-            pad_mask: FloatTensor (B x T)
-            return_other: Bool (returns other information for logging)
         """
-
-        # Forward model
         feat, feat_final, pred, pad_mask = self.distiller(wave_input, pad_mask)
 
+        teachers_hidden_states = {}
         with torch.no_grad():
             wave_orig = [wave.to(wave_input.device) for wave in wave_orig]
-            with torch.cuda.amp.autocast(False):
-                teacher_hiddens_1 = self.teacher_1(wave_orig)
-                # Calculate the length of each waveform in the batch as individual tensors
-                # lengths = [torch.tensor([wave.size(-1)], device=wave.device) for wave in wave_orig]  # List of 1-element tensors
-                # melspecs = [self.mel_spectrogram_transform(wave) for wave in wave_orig] 
-                # melspecs = torch.stack(melspecs)
-                if isinstance(wave_orig, list):
+            if isinstance(wave_orig, list):
                     max_length = max(wave.size(0) for wave in wave_orig)
                     padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig]
                     wave_orig = torch.stack(padded_wave_orig).to(wave_input.device)
+            with torch.cuda.amp.autocast(False):
+                # Loop through the teacher models to gather hidden states
+                for model_name, teacher in self.teacher_models.items():
+                    if model_name == 'hubert_base':
+                        teacher_hiddens = teacher(wave_orig)
+                    elif model_name == 'mert_v0_public':
+                        teacher_hiddens = teacher(wave_orig)
+                    elif model_name == 'ast':
+                        inputs = self.teacher_processors[model_name](wave_orig.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
+                        inputs = {key: value.to('cuda:0') for key, value in inputs.items()}
+                        teacher_hiddens = teacher(**inputs)
 
-                teacher_hiddens_2 = self.teacher_2(wave_orig)
-                # teacher_hiddens_3 = self.teacher_3(melspecs, lengths=lengths)
-                # waveform, sample_rate = torchaudio.load(wave_orig)
-                inputs = self.teacher_3_processor(wave_orig.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-                inputs = {key: value.to('cuda:0') for key, value in inputs.items()}
-                teacher_hiddens_3 = self.teacher_3(**inputs)
-
-            teachers_hidden_states = {}
-            if self.config.task_emb_type == "none":
-                teacher_hiddens = teacher_hiddens["hidden_states"][self.config.n_tasks]
-                teacher_hiddens = teacher_hiddens.unsqueeze(1)
-                # teacher_hiddens_2 = teacher_hiddens_2["hidden_states"][self.config.n_tasks]
-                # teacher_hiddens_2 = teacher_hiddens_2.unsqueeze(1)
-                # teacher_hiddens_3 = teacher_hiddens_3["hidden_states"][self.config.n_tasks]
-                # teacher_hiddens_3 = teacher_hiddens_3.unsqueeze(1)
-                # print(teacher_hiddens.shape)
-                # print(teacher_hiddens_2.shape)
-                # print(teacher_hiddens_3.shape)
-            else:
-                if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden"]:
-                    # Initialize a dictionary to hold the hidden state features for each teacher
-
-                    # Extract hidden states for teacher 1
-                    teacher_hiddens_1 = [
-                        teacher_hiddens_1["hidden_states"][i]
-                        for i in self.distiller.pred_layer_id
-                    ]
-                    teachers_hidden_states[self.teachers.model_1] = torch.stack(teacher_hiddens_1, dim=1)
-
-                    # print("============================================================")
-                    # # Iterate through the list and print the shape of each tensor for teacher 1
-                    # for i, hidden in enumerate(teacher_hiddens_1):
-                    #     print(f"Shape of HuBERT hidden state {i}: {hidden.shape}")
-
-                    # Extract hidden states for teacher 2
-                    teacher_hiddens_2 = [
-                        teacher_hiddens_2["hidden_states"][i]
-                        for i in self.distiller.pred_layer_id
-                    ]
-                    teachers_hidden_states[self.teachers.model_2] = torch.stack(teacher_hiddens_2, dim=1)
-
-                    # print("============================================================")
-                    # # Iterate through the list and print the shape of each tensor for teacher 2
-                    # for i, hidden in enumerate(teacher_hiddens_2):
-                    #     print(f"Shape of MERT hidden state {i}: {hidden.shape}")
-
-                    # Extract hidden states for teacher 3
-                    teacher_hiddens_3 = [
-                        teacher_hiddens_3["hidden_states"][i]
-                        for i in self.distiller.pred_layer_id
-                    ]
-                    teachers_hidden_states[self.teachers.model_3] = torch.stack(teacher_hiddens_3, dim=1)
-
-                    # print("============================================================")
-                    # # Iterate through the list and print the shape of each tensor for teacher 3
-                    # for i, hidden in enumerate(teacher_hiddens_3):
-                    #     print(f"Shape of AST hidden state {i}: {hidden.shape}")
-
-                    # Print the dictionary keys to confirm the correct structure
-                    # print("Teacher Hidden States Dictionary Keys:", teachers_hidden_states.keys())
-
-                    # Optional: Print the shapes of hidden states in the dictionary
-                    # for teacher, hidden_states in teachers_hidden_states.items():
-                    #     print(f"Hidden states for {teacher}:")
-                    #     for i, hidden in enumerate(hidden_states):
-                    #         print(f"  Layer {i}: {hidden.shape}")
-                else:
-                    teacher_hiddens = teacher_hiddens["hidden_states"][1:]
-                # teacher_hiddens = torch.stack(teacher_hiddens, dim=1)  # B x N x T x D
+                    # Extract hidden states based on task embedding type
+                    if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden"]:
+                        teacher_hiddens = [
+                            teacher_hiddens["hidden_states"][i]
+                            for i in self.distiller.pred_layer_id
+                        ]
+                        teachers_hidden_states[model_name] = torch.stack(teacher_hiddens, dim=1)
 
         # Compute all objectives
         (
             total_loss,
             rec_loss,
-            rec_layer_loss,
+            rec_layer_loss_dict,
             feat_pen,
             sim_loss,
-            sim_layer_loss,
+            sim_layer_loss_dict,
         ) = self.compute_loss(feat, pred, teachers_hidden_states, return_other)
 
         if return_other:
@@ -521,35 +467,47 @@ class MultiDistillerForPretrain(nn.Module):
                     "sim_loss": sim_loss,
                     "norm_feat_final": feat_final.pow(2).mean(),
                 }
-                teacher_norm = torch.abs(teacher_hiddens).mean((0, 2, 3))
-                if self.config.task_emb_type == "none":
-                    other_res[f"rec_l{self.config.n_tasks}"] = rec_layer_loss[0]
-                    other_res[f"tar_norm_l{self.config.n_tasks}"] = teacher_norm[0]
-                    if sim_layer_loss is not None:
-                        other_res[f"sim_l{self.config.n_tasks}"] = sim_layer_loss[0]
-                else:
-                    for i in range(self.config.n_tasks):
-                        layer_id = i + 1
-                        if self.config.task_emb_type in [
-                            "expand-last",
-                            "hnet",
-                            "self-hidden",
-                        ]:
-                            layer_id = self.distiller.pred_layer_id[i]
-                        other_res[f"rec_l{layer_id}"] = rec_layer_loss[i]
-                        other_res[f"tar_norm_l{layer_id}"] = teacher_norm[i]
-                        if sim_layer_loss is not None:
-                            other_res[f"sim_l{layer_id}"] = sim_layer_loss[i]
-                    if self.config.task_emb_type not in [
-                        "expand-last",
-                        "hnet",
-                        "self-hidden",
-                    ]:
-                        other_res[
-                            "norm_task_emb"
-                        ] = self.distiller.task_embedding.weight.pow(2).mean()
+
+                # Initialize a dictionary to keep norms for each teacher
+                teacher_norms = {}
+
+                # Calculate norms for each teacher and add to teacher_norms
+                for model_name, hidden_states in teachers_hidden_states.items():
+                    teacher_norms[model_name] = torch.abs(hidden_states).mean((0, 2, 3))
+
+                # Log metrics for each teacher
+                for model_name, norm in teacher_norms.items():
+                    # Retrieve the layer-wise losses from the dictionaries
+                    rec_layer_loss = rec_layer_loss_dict.get(model_name, None)
+                    sim_layer_loss = sim_layer_loss_dict.get(model_name, None)
+
+                    if rec_layer_loss is not None:
+                        # If task_emb_type is 'none', log only the first layer as before
+                        if self.config.task_emb_type == "none":
+                            other_res[f"rec_l_{model_name}_{self.config.n_tasks}"] = rec_layer_loss[0]
+                            other_res[f"tar_norm_l_{model_name}_{self.config.n_tasks}"] = norm[0]
+                            if sim_layer_loss is not None:
+                                other_res[f"sim_l_{model_name}_{self.config.n_tasks}"] = sim_layer_loss[0]
+                        else:
+                            # Otherwise, log all layers or based on pred_layer_id
+                            for i in range(min(self.config.n_tasks, len(rec_layer_loss))):
+                                layer_id = i + 1
+                                if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden"]:
+                                    layer_id = self.distiller.pred_layer_id[i]
+
+                                # Logging for each layer of each teacher
+                                other_res[f"rec_l_{model_name}_{layer_id}"] = rec_layer_loss[i]
+                                other_res[f"tar_norm_l_{model_name}_{layer_id}"] = norm[i]
+                                if sim_layer_loss is not None and i < len(sim_layer_loss):
+                                    other_res[f"sim_l_{model_name}_{layer_id}"] = sim_layer_loss[i]
+
+                # Additional task embedding logging if applicable
+                if self.config.task_emb_type not in ["expand-last", "hnet", "self-hidden"]:
+                    other_res["norm_task_emb"] = self.distiller.task_embedding.weight.pow(2).mean()
         else:
             other_res = None
+
+
 
         return total_loss, other_res
 
@@ -620,5 +578,3 @@ class MultiDistillerForPretrain(nn.Module):
 
         # print("=====================================", total_loss)
         return total_loss, total_rec_loss, rec_layer_loss_dict, total_feat_pen, total_sim_loss, sim_layer_loss_dict
-
-

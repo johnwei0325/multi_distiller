@@ -41,6 +41,13 @@ class OnlineWaveDataset(WaveDataset):
         if self.libri_root is None:
             return torch.FloatTensor(np.load(os.path.join(self.root, feat_path)))
         wav, _ = torchaudio.load(os.path.join(self.libri_root, feat_path))
+        if wav.shape[0] == 2:  # Check if stereo (2 channels)
+            wav = wav.mean(dim=0, keepdim=True)  # Average across channels to get mono
+        wav = wav.unsqueeze(0) if wav.dim() == 1 else wav  # Add channel dimension if missing
+
+        max_len = 250000  # Set a maximum length (e.g., 1 second of audio at 16kHz)
+        if wav.size(1) > max_len:
+            wav = wav[:, :max_len]
         return wav.squeeze()  # (seq_len)
 
     def __getitem__(self, index):

@@ -42,16 +42,20 @@ def get_preprocess_args():
 # EXTRACT LENGTH #
 ##################
 def extract_length(input_file):
-    torchaudio.set_audio_backend("sox_io")
-    return torchaudio.info(input_file).num_frames
-
-
+    torchaudio.set_audio_backend("soundfile")  # Ensure correct backend is set
+    try:
+        metadata = torchaudio.info(input_file)
+        return metadata.num_frames  # This should return the length of the audio
+    except Exception as e:
+        print(f"Error processing {input_file}: {e}")
+        return 0 
 ###################
 # GENERATE LENGTH #
 ###################
 def generate_length(args, tr_set, audio_extension):
     
     for i, s in enumerate(tr_set):
+        print(tr_set)
         if os.path.isdir(os.path.join(args.input_data, s.lower())):
             s = s.lower()
         elif os.path.isdir(os.path.join(args.input_data, s.upper())):
@@ -92,6 +96,10 @@ def main():
         SETS = ['train-clean-100', 'train-clean-360', 'train-other-500', 'dev-clean', 'dev-other', 'test-clean', 'test-other']
     elif 'timit' in args.input_data.lower():
         SETS = ['TRAIN', 'TEST']
+    elif 'audioset' in args.input_data.lower():
+        SETS = ['TRAIN']
+    elif 'music4all' in args.input_data.lower():
+        SETS = ['audios']
     else:
         raise NotImplementedError
     # change the SETS list to match your dataset, for example:

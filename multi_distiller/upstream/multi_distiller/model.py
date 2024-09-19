@@ -16,6 +16,8 @@ from .feature_size import get_model_feature_size
 from omegaconf import DictConfig, OmegaConf
 from .feature_translators import build_feature_translator
 
+
+
 class MultiDistillerConfig:
     """
     Configuration class
@@ -183,7 +185,6 @@ class MultiDistillerModel(nn.Module):
             translator_kwargs["input_size"] = self.backbone_feature_size
             translator_kwargs["target_model_names"] = self.teacher_names
             self.translator = build_feature_translator(config.translator_type, **translator_kwargs)
-
 
     def forward_feature(self, wave, pad_mask):
         """Forward feature extractor"""
