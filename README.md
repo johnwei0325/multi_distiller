@@ -28,9 +28,28 @@ python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/LibriSpeech/
 ```
 ### AudioSet
 1) Download AdusioSet data from [here](https://www.kaggle.com/datasets/zfturbo/audioset).
-
+2) Convert audio sampling rate from 44100HZ to 16000HZ
+```bash
+python3 dataset_preprocess/change_rate.py PATH_TO_YOUR/AudioSet/ --n_jobs Number of parallel jobs --output_dir
+```
+3) Gnerate meta data for AudioSet
+```bash
+python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/AudioSet/
+```
 ### Music4all
 1) Get data access from [here](https://sites.google.com/view/contact4music4all).
+2) Convert audio sampling rate from 48000HZ to 16000HZ
+```bash
+python3 dataset_preprocess/change_rate.py PATH_TO_YOUR/music4all/ --n_jobs Number of parallel jobs --output_dir
+```
+3) Generate meta data for music4all
+```bash
+python3 preprocess/generate_len_for_bucket.py -i PATH_TO_YOUR/music4all/
+```
+### meta data for mixed dataset
+```bash
+python3 dataset_preprocess/combine_dataset.py PATH_TO_YOUR/music4all/
+```
 
 ## Step 3) Modifiy runner config
 1) Open `S3PRL/pretrain/tera/config_runner.yaml`:
