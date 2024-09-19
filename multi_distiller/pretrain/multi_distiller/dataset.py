@@ -10,6 +10,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import torchaudio
 from pretrain.bucket_dataset import WaveDataset
+import torch.nn.functional as F 
 
 
 class OnlineWaveDataset(WaveDataset):
@@ -45,21 +46,45 @@ class OnlineWaveDataset(WaveDataset):
             wav = wav.mean(dim=0, keepdim=True)  # Average across channels to get mono
         wav = wav.unsqueeze(0) if wav.dim() == 1 else wav  # Add channel dimension if missing
 
-        max_len = 250000  # Set a maximum length (e.g., 1 second of audio at 16kHz)
-        if wav.size(1) > max_len:
-            wav = wav[:, :max_len]
+
         return wav.squeeze()  # (seq_len)
 
+
     def __getitem__(self, index):
-        # Load acoustic feature and pad
-        x_batch = [self._sample(self._load_feat(x_file)) for x_file in self.X[index]]
-        x_lens = [len(x) for x in x_batch]
-        x_lens = torch.LongTensor(x_lens)
-        x_pad_batch = pad_sequence(x_batch, batch_first=True)
+        try:
+            x_batch = []
 
-        pad_mask = torch.ones(x_pad_batch.shape)  # (batch_size, seq_len)
-        # zero vectors for padding dimension
-        for idx in range(x_pad_batch.shape[0]):
-            pad_mask[idx, x_lens[idx] :] = 0
+            for x_file in self.X[index]:
+                # Load the waveform
+                waveform = self._sample(self._load_feat(x_file))
+                
+                # Handle multi-channel (stereo) audio: downmix to mono if more than 1 channel
+                if waveform.ndim == 2 and waveform.shape[0] > 1:  # Check if multi-channel
+                    print(f"Multi-channel audio detected: {waveform.shape}, downmixing to mono.", index)
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)  # Downmix to mono
+                    waveform = waveform.squeeze(0)
 
-        return [x_pad_batch, x_batch, x_lens, pad_mask]
+                #     waveform = waveform.unsqueeze(0)  # Add channel dimension if it's missing
+
+                # Ensure waveform length consistency: pad to 160000 samples if needed
+                if waveform.shape[-1] < 160000:  # If waveform is shorter than 160000
+                    waveform = F.pad(waveform, (0, 160000 - waveform.shape[-1]))
+                # Ensure the waveform has at least 2 dimensions (for compatibility with Conv1d)
+
+
+                x_batch.append(waveform)
+
+            # Pad the sequences to the length of the longest sequence
+            x_pad_batch = pad_sequence(x_batch, batch_first=True)
+
+            # Create the padding mask
+            x_lens = torch.LongTensor([wave.shape[-1] for wave in x_batch])  # Sequence lengths
+            pad_mask = torch.ones(x_pad_batch.shape[:2], dtype=torch.bool)  # (batch_size, seq_len)
+            for idx in range(x_pad_batch.shape[0]):
+                pad_mask[idx, x_lens[idx]:] = 0  # Mask out padding regions with zeros
+
+            return [x_pad_batch, x_batch, x_lens, pad_mask]
+
+        except Exception as e:
+            print(f"Error occurred at index {index}: {e}")
+            raise e  # Re-raise the exception to stop the process
