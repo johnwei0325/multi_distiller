@@ -306,10 +306,7 @@ class MultiDistillerForPretrain(nn.Module):
         
         # Freeze all teacher models
         for teacher in self.teacher_models.values():
-            if isinstance(teacher, SSASTPredModule):
-                freeze_model(teacher.encoder) 
-            else:
-                freeze_model(teacher)
+            freeze_model(teacher)
         
         # Initialize loss function
         if config.loss_type == "l1":
@@ -481,7 +478,6 @@ class MultiDistillerForPretrain(nn.Module):
         Forward function.
         """
         feat, feat_final, pred, pad_mask = self.distiller(wave_input, pad_mask)
-        print('========================',wave_orig_16k[0].shape, wave_orig_24k[0].shape)
         teachers_hidden_states = {}
         with torch.no_grad():
             wave_orig_16k = [wave.to(wave_input.device) for wave in wave_orig_16k]
@@ -506,7 +502,7 @@ class MultiDistillerForPretrain(nn.Module):
                         features = torch.stack(features, dim=0)
                         teacher_hiddens, features = teacher(features)
                         teacher_hiddens = torch.stack(teacher_hiddens)
-                        padded_hidden_states = F.pad(teacher_hiddens, (0, 0, 0, 0, 0, 0, 0, 1)) # Adding one dimension from 12 to 13
+                        padded_hidden_states = F.pad(teacher_hiddens, (0, 0, 0, 0, 0, 0, 1, 0)) # Adds one dimension from 12 to 13 at the start
                         teacher_hiddens = {"hidden_states": padded_hidden_states}
                     # Extract hidden states based on task embedding type
                     if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden"]:
@@ -515,7 +511,6 @@ class MultiDistillerForPretrain(nn.Module):
                             for i in self.distiller.pred_layer_id
                         ]
                         teachers_hidden_states[model_name] = torch.stack(teacher_hiddens, dim=1)
-                        print(torch.stack(teacher_hiddens, dim=1).shape)
 
         # Compute all objectives
         (
