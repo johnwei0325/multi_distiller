@@ -74,23 +74,23 @@ class OnlineWaveDataset(WaveDataset):
                     waveform_16k = waveform
 
                 # Resample to 24 kHz if the sample rate is different
-                if sample_rate != target_sample_rate_24k:
-                    resample_transform_24k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate_24k)
-                    waveform_24k = resample_transform_24k(waveform)
-                else:
-                    waveform_24k = waveform
+                # if sample_rate != target_sample_rate_24k:
+                    # resample_transform_24k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate_24k)
+                    # waveform_24k = resample_transform_24k(waveform)
+                # else:
+                    # waveform_24k = waveform
 
                 # Handle multi-channel (stereo) audio: downmix to mono if more than 1 channel
                 if waveform_16k.ndim == 2 and waveform_16k.shape[0] > 1:  # Check if multi-channel for 16k
                     print(f"Multi-channel audio detected: {waveform_16k.shape}, downmixing to mono.", index)
                     waveform_16k = torch.mean(waveform_16k, dim=0, keepdim=True).squeeze(0)  # Downmix to mono
-                if waveform_24k.ndim == 2 and waveform_24k.shape[0] > 1:  # Check if multi-channel for 24k
-                    waveform_24k = torch.mean(waveform_24k, dim=0, keepdim=True).squeeze(0)  # Downmix to mono
+                # if waveform_24k.ndim == 2 and waveform_24k.shape[0] > 1:  # Check if multi-channel for 24k
+                    # waveform_24k = torch.mean(waveform_24k, dim=0, keepdim=True).squeeze(0)  # Downmix to mono
 
                 # Normalize waveforms and append to the respective lists
                 x_batch.append(waveform_16k - waveform_16k.mean())
-                x_batch_24k.append(waveform_24k - waveform_24k.mean())
-
+                # x_batch_24k.append(waveform_24k - waveform_24k.mean())
+                x_batch_24k = []
             # Pad the sequences to the length of the longest sequence for 16 kHz
             x_pad_batch = pad_sequence(x_batch, batch_first=True)
 

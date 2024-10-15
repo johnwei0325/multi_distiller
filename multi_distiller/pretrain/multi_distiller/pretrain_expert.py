@@ -85,6 +85,11 @@ def freeze_model(model):
     for param in model.parameters():
         param.requires_grad = False
 
+def unfreeze_model(model):
+    """Freeze all parameters in a model."""
+    for param in model.parameters():
+        param.requires_grad = True
+
 def remap_keys(state_dict, prefix):
     """Remap keys in the state_dict to match the model's expected structure."""
     new_state_dict = {}
@@ -113,7 +118,8 @@ class UpstreamPretrainExpert(nn.Module):
         self.datarc = datarc
         self.device = device
         self.multi_gpu = multi_gpu
-
+        self.freeze = False
+        self.count_freeze = 0
         if type(upstream_config) == str:
             self.upstream_config = yaml.load(
                 open(upstream_config, "r"), Loader=yaml.FullLoader
@@ -203,7 +209,20 @@ class UpstreamPretrainExpert(nn.Module):
         Return:
             loss
         """
+        # if self.freeze:
+        #     self.count_freeze += 1
+        #     if self.count_freeze == 500:
+        #         unfreeze_model(self.model.distiller)
+        #         print('Unfreezed Student')
+        #         self.freeze = False
+        #         self.count_freeze = 0
 
+        # if global_step % 2500 == 0 and not self.freeze:
+        #     freeze_model(self.model.distiller)
+        #     unfreeze_model(self.model.distiller.translator)
+        #     print('Freezed Student')
+        #     self.freeze = True
+        
         wave_input, wave_orig_16k, wave_orig_24k, wave_len, pad_mask = data
         wave_input = wave_input.to(self.device)
         wave_len = wave_len.to(self.device)
@@ -290,11 +309,10 @@ class MultiDistillerForPretrain(nn.Module):
                 teacher_2 = AutoModel.from_pretrained("m-a-p/MERT-v0-public", config=temp_config, trust_remote_code=True).to(device)
                 disable_MERT_encoder_dropout(teacher_2)
                 self.teacher_models[model_name] = teacher_2
-            elif model_name == 'ast':
+            elif model_name == 'ssast_frame':
                 self.temporal_alignment = TemporalAligner()
                 teacher_3 = ASTModel(fshape=128, tshape=2, fstride=128, tstride=1, input_tdim=1024, input_fdim=128,
                                   model_size='base', pretrain_stage=False, load_pretrained_mdl_path="/mnt/data/ycevan/johnwei/SSAST-Base-Frame-400.pth").to(device)
-                print(teacher_3)
                 teacher_3_processor = FeatureExtractor(target_length=1024, apply_cmvn=False)
                 print(f"teacher_3_processor is {teacher_3_processor}")
                 disable_SSAST_encoder_dropout(teacher_3)
@@ -321,7 +339,7 @@ class MultiDistillerForPretrain(nn.Module):
             print("[DistillerForPretrain] - Enabled cosine similarity loss.")
         
         # Ensure that we can only load weights from hubert_base or mert_v0_public
-        model_to_initialize = self.config.initialize_from[0]
+        model_to_initialize = self.config.initialize_from[0][0]
         if model_to_initialize == 'ast':
             raise AssertionError("[Error] Cannot initialize weights from 'ast' model. The student's architecture is compatible only with 'hubert_base' or 'mert_v0_public'.")
         elif model_to_initialize == 'hubert_base':
@@ -485,19 +503,19 @@ class MultiDistillerForPretrain(nn.Module):
                     max_length = max(wave.size(0) for wave in wave_orig_16k)
                     padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig_16k]
                     wave_orig_16k = torch.stack(padded_wave_orig).to(wave_input.device)
-            wave_orig_24k = [wave.to(wave_input.device) for wave in wave_orig_24k]
-            if isinstance(wave_orig_24k, list):
-                    max_length = max(wave.size(0) for wave in wave_orig_24k)
-                    padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig_24k]
-                    wave_orig_24k = torch.stack(padded_wave_orig).to(wave_input.device)
+            # wave_orig_24k = [wave.to(wave_input.device) for wave in wave_orig_24k]
+            # if isinstance(wave_orig_24k, list):
+            #         max_length = max(wave.size(0) for wave in wave_orig_24k)
+            #         padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig_24k]
+            #         wave_orig_24k = torch.stack(padded_wave_orig).to(wave_input.device)
             with torch.cuda.amp.autocast(False):
                 # Loop through the teacher models to gather hidden states
                 for model_name, teacher in self.teacher_models.items():
                     if model_name == 'hubert_base':
                         teacher_hiddens = teacher(wave_orig_16k)
                     elif model_name == 'mert_v0_public':
-                        teacher_hiddens = teacher(wave_orig_24k)
-                    elif model_name == 'ast':
+                        teacher_hiddens = teacher(wave_orig_16k)
+                    elif model_name == 'ssast_frame':
                         features = [self.teacher_processors[model_name](wav.unsqueeze(0)) for wav in wave_orig_16k]
                         features = torch.stack(features, dim=0)
                         teacher_hiddens, features = teacher(features)
@@ -574,6 +592,9 @@ class MultiDistillerForPretrain(nn.Module):
 
         return total_loss, other_res
 
+    def l2_normalize(self, tensor):
+        return tensor / tensor.norm(p=2, dim=-1, keepdim=True)
+
     def compute_loss(self, feat, pred, target, return_other=False):
         """
         Computes loss for multiple teachers.
@@ -596,13 +617,14 @@ class MultiDistillerForPretrain(nn.Module):
 
         # Iterate over each teacher's predictions and targets
         for teacher_key in target.keys(): ## on the meantime.... this needs to be fixed
-            teacher_pred = pred    # [teacher_key]  # Prediction from the current teacher
+            # teacher_pred = pred    # [teacher_key]  # Prediction from the current teacher
+            teacher_pred = pred[teacher_key]
             teacher_target = target[teacher_key]  # Target corresponding to the current teacher
-            
+
             aligned_preds = []  # To store aligned student features
             aligned_targets = []  # To store aligned teacher features
 
-            for i in range(pred.shape[1]): ### do this outside... is better and more efficient, capitalize one of the for already being done outside...
+            for i in range(teacher_pred.shape[1]): ### do this outside... is better and more efficient, capitalize one of the for already being done outside...
                 align_teacher, align_student = self.temporal_alignment(teacher_target[:,i,:,:], teacher_pred[:,i,:,:])
                 # Append the aligned features to the lists
                 aligned_preds.append(align_student.unsqueeze(1))  # Add back the layer dimension
@@ -611,18 +633,30 @@ class MultiDistillerForPretrain(nn.Module):
             # Concatenate aligned layers back to 4D tensors (batch, layers, time, feature_dim)
             teacher_pred = torch.cat(aligned_preds, dim=1)
             teacher_target = torch.cat(aligned_targets, dim=1)
-                    
-            # Ensure shapes match
+            
+            # teacher_pred = self.l2_normalize(teacher_pred)
+            # teacher_target = self.l2_normalize(teacher_target)
+            # # Ensure shapes match
+            # print(teacher_key, ':', teacher_pred.shape, ' ', teacher_target.shape)
             assert teacher_pred.shape == teacher_target.shape, (teacher_pred.shape, teacher_target.shape)
 
             # Compute reconstruction loss
             rec_loss = self.loss_func(teacher_pred, teacher_target)  # B x N x T x D
-            total_rec_loss += rec_loss.mean()
+            if teacher_key == 'ssast_frame':
+                weighted_loss = rec_loss.mean() * 0.1
+            else:
+                weighted_loss = rec_loss.mean()
+
+            total_rec_loss += weighted_loss
 
             # Optionally compute layer-wise reconstruction loss
             if return_other:
                 with torch.no_grad():
                     rec_layer_loss = rec_loss.mean((0, 2, 3))  # Per-layer reconstruction loss
+                    if teacher_key == 'ssast_frame':
+                        rec_layer_loss = rec_layer_loss * 0.1
+                    else:
+                        rec_layer_loss = rec_layer_loss
                 rec_layer_loss_dict[teacher_key] = rec_layer_loss
             else:
                 rec_layer_loss_dict[teacher_key] = None
