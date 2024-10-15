@@ -105,6 +105,42 @@ def remap_keys(state_dict, prefix):
         new_state_dict[f'{prefix}.{new_key}'] = value
     return new_state_dict
 
+def average_weights(mapped_state_dicts):
+    """Averages the weights from multiple state_dicts."""
+    avg_dict = collections.OrderedDict()
+
+    keys = mapped_state_dicts[0].keys()
+    for key in keys:
+        weights = [sd[key] for sd in mapped_state_dicts]
+        avg_dict[key] = torch.mean(torch.stack(weights), dim=0)
+
+    return avg_dict
+
+def rename_attention_keys_mert(state_dict):
+    new_state_dict = {}
+    for key in state_dict.keys():
+        new_key = key
+
+        # Map "attention" to "self_attn"
+        new_key = new_key.replace("attention.k_proj", "self_attn.k_proj")
+        new_key = new_key.replace("attention.v_proj", "self_attn.v_proj")
+        new_key = new_key.replace("attention.q_proj", "self_attn.q_proj")
+        new_key = new_key.replace("attention.out_proj", "self_attn.out_proj")
+
+        # Map "layer_norm" to "self_attn_layer_norm"
+        new_key = new_key.replace("layer_norm", "self_attn_layer_norm")
+
+        # Map "feed_forward" to "fc1" and "fc2"
+        new_key = new_key.replace("feed_forward.intermediate_dense", "fc1")
+        new_key = new_key.replace("feed_forward.output_dense", "fc2")
+
+        # Handle the final layer norm rename
+        new_key = new_key.replace("final_self_attn_layer_norm", "final_layer_norm")
+
+        new_state_dict[new_key] = state_dict[key]
+
+    return new_state_dict
+
 class UpstreamPretrainExpert(nn.Module):
     """
     The Distiller pretrain expert
@@ -348,6 +384,9 @@ class MultiDistillerForPretrain(nn.Module):
         elif model_to_initialize == 'mert_v0_public':
             print(f"Initializing student model from {model_to_initialize}...")
             self.load_teacher_weights('mert_v0_public')
+        elif model_to_initialize == 'avg':
+            print(f"Initializing student model from {model_to_initialize}...")
+            self.load_teacher_weights('avg')
 
 
     def load_teacher_weights(self, teacher_name, device="cuda"):
@@ -369,7 +408,38 @@ class MultiDistillerForPretrain(nn.Module):
                     print("[HuBERT] - Disabled teacher's encoder layerdrop")
             else:
                 raise ValueError(f"[Error] Teacher model '{teacher_name}' not found in the loaded teacher models.")
-
+            
+        if teacher_name == 'avg':
+            print(f"[DistillerForPretrain] - Loading weights from {teacher_name}")
+            
+            # Load weights for feature extractor
+            if self.config.init_teacher_conv_layers:
+                print(f"[DistillerForPretrain] - Initializing feature extractor from {teacher_name}")
+                self.distiller.feature_extractor.load_state_dict(
+                    teacher_model.model.feature_extractor.state_dict()
+                )
+                if self.distiller.post_extract_proj is not None:
+                    self.distiller.post_extract_proj.load_state_dict(
+                        teacher_model.model.post_extract_proj.state_dict()
+                    )
+            
+            # Load weights for encoder layers
+            if self.config.init_teacher_encoder_layers:
+                print(f"[DistillerForPretrain] - Initializing encoder from {teacher_name}")
+                self.distiller.encoder.pos_conv.load_state_dict(
+                    teacher_model.model.encoder.pos_conv.state_dict()
+                )
+                for l in range(self.config.encoder_layers):
+                    converted_state_dict_mert = rename_attention_keys_mert(self.teacher_models['mert_v0_public'].encoder.layers[l].state_dict())
+                    state_dict_hubert = self.teacher_models['hubert_base'].model.encoder.layers[l].state_dict()
+                    averaged_encoder = average_weights([converted_state_dict_mert, state_dict_hubert])
+                    student_encoder = self.distiller.encoder.layers[l].state_dict()
+                    for k, v in averaged_encoder.items():
+                        if k in student_encoder:
+                            student_encoder[k] = v
+                    self.distiller.encoder.layers[l].load_state_dict(
+                        student_encoder
+                    )
         # Example: loading weights from hubert_base or mert_v0_public for feature extractor
         if teacher_name == 'hubert_base':
             print(f"[DistillerForPretrain] - Loading weights from {teacher_name}")
@@ -482,6 +552,9 @@ class MultiDistillerForPretrain(nn.Module):
                         new_encoder_layer_dict[new_key] = value
 
                     self.distiller.encoder.layers[l].load_state_dict(new_encoder_layer_dict)
+
+
+
 
     def forward(
         self,
