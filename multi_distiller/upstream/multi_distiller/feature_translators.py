@@ -4,7 +4,7 @@ from typing import Any, Optional, Dict, Tuple, List, Union
 import torch
 import torch.nn as nn
 
-from .adapter_heads import LightConvAdapterHead, TransformerAdapterHead, LSTMAdapterHead
+from .adapter_heads import LightConvAdapterHead
 
 
 class FeatureTranslator(nn.Module):
@@ -131,91 +131,6 @@ class LightConvFeatureTranslator(FeatureTranslator):
             translator_heads[target_model] = head
         self.translator_heads = nn.ModuleDict(translator_heads)
 
-class LSTMFeatureTranslator(FeatureTranslator):
-    def __init__(
-        self,
-        target_model_names: list,
-        input_size: Tuple[int, int, int, int],
-        translator_hidden_size: int = 1024,
-        hidden_size_factor: Union[int, float] = 1.0,
-    ) -> None:
-        """Initialization function for LSTMFeatureTranslator.
-            It's for an LSTM-based translator compared to ConvFeatureTranslator.
-
-        Args:
-            target_model_names (list): names of the target models.
-            input_size (Tuple[int, int, int, int]): the size of the input feature (e.g., [B, T, H, C]).
-            translator_hidden_size (Optional[int]): the hidden dim of the translator. Defaults to 1024.
-            hidden_size_factor: the size of hidden dim of feature translator as a factor of input feature hidden dim. Defaults to 1.0
-        """
-        self.hidden_size_factor = hidden_size_factor
-        super().__init__(
-            target_model_names=target_model_names,
-            input_size=input_size,
-            translator_hidden_size=translator_hidden_size,
-        )
-        self.backbone_adapter = nn.Identity()
-
-    def build_translator_heads(self) -> None:
-        """Build LSTM-based translator heads to match the dimension of each target feature set."""
-        translator_heads = {}
-        for target_model in self.target_model_names:
-            head = LSTMAdapterHead(
-                source_size=self.input_size,
-                target_model=target_model,
-                hidden_size_factor=self.hidden_size_factor
-            )
-            translator_heads[target_model] = head
-        self.translator_heads = nn.ModuleDict(translator_heads)
-
-class TransformerFeatureTranslator(FeatureTranslator):
-    def __init__(
-        self,
-        target_model_names: list,
-        input_size: Tuple[int, int, int, int],
-        translator_hidden_size: int = 1024,
-        hidden_size_factor: Union[int, float] = 1.0,
-        num_layers: int = 2,
-        num_heads: int = 4,
-        ff_dim: int = 512,
-    ) -> None:
-        """Initialization function for TransformerFeatureTranslator.
-
-        Args:
-            target_model_names (list): names of the target models.
-            input_size (Tuple[int, int, int, int]): the size of the input feature (e.g., [B, T, H, C]).
-            translator_hidden_size (Optional[int]): the hidden dim of the translator. Defaults to 1024.
-            hidden_size_factor: the size of hidden dim of feature translator as a factor of input feature hidden dim. Defaults to 1.0
-            num_layers (int): number of transformer layers.
-            num_heads (int): number of attention heads in the transformer.
-            ff_dim (int): hidden size of the feed-forward network within the transformer.
-        """
-        self.hidden_size_factor = hidden_size_factor
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        super().__init__(
-            target_model_names=target_model_names,
-            input_size=input_size,
-            translator_hidden_size=translator_hidden_size,
-        )
-        self.backbone_adapter = nn.Identity()
-        print('===========================================')
-    def build_translator_heads(self) -> None:
-        """Build transformer-based translator heads to match the dimension of each target feature set."""
-        translator_heads = {}
-        for target_model in self.target_model_names:
-            head = TransformerAdapterHead(
-                source_size=self.input_size,
-                target_model=target_model,
-                hidden_size_factor=self.hidden_size_factor,
-                num_layers=self.num_layers,
-                num_heads=self.num_heads,
-                ff_dim=self.ff_dim,
-            )
-            translator_heads[target_model] = head
-        self.translator_heads = nn.ModuleDict(translator_heads)
-
 
 def build_feature_translator(translator_type: str, **kwargs: Any) -> FeatureTranslator:
     """Handy function to build feature translators given the type
@@ -228,7 +143,6 @@ def build_feature_translator(translator_type: str, **kwargs: Any) -> FeatureTran
     Returns:
         FeatureTranslator: the corresponding FeatureTranslator
     """
-    print("[Feautre Translator Type] ", translator_type)
     if translator_type == "mlp":
         return MLPFeatureTranslator(**kwargs)
     elif translator_type == "conv":
@@ -237,7 +151,5 @@ def build_feature_translator(translator_type: str, **kwargs: Any) -> FeatureTran
         return LightConvFeatureTranslator(**kwargs)
     elif translator_type == "transformer" or translator_type == "trans":
         return TransformerFeatureTranslator(**kwargs)
-    elif translator_type == "lstm":
-        return LSTMFeatureTranslator(**kwargs)
     else:
         raise NotImplementedError(f"Requested {translator_type} is not implemented yet.")

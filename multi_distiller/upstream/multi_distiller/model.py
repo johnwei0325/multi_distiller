@@ -15,7 +15,6 @@ from .module import (
 from .feature_size import get_model_feature_size
 from omegaconf import DictConfig, OmegaConf
 from .feature_translators import build_feature_translator
-from einops.layers.torch import Rearrange
 
 
 
@@ -85,11 +84,6 @@ class MultiDistillerConfig:
         self.teacher_names = config.get('teacher_names')
         self.translator_kwargs = config.get('translator_kwargs')
         self.translator_type = config.get('translator_type')
-        self.initialize_from = config.get('initialize_from')
-
-        self.initialize_from = [['hubert_base']]
-        self.fbank_mean = 0
-        self.fbank_std = 0
 
 class MultiDistillerModel(nn.Module):
     """
@@ -100,7 +94,6 @@ class MultiDistillerModel(nn.Module):
         super().__init__()
 
         self.config = config
-        self.teacher_names = config.teacher_names
 
         self.conv_layers = eval(config.extractor_conv_feature_layers)
         feat_emb_dim = self.conv_layers[-1][0]
@@ -169,90 +162,29 @@ class MultiDistillerModel(nn.Module):
         if config.out_layer_type == "expand-last":
             assert self.task_emb_type == "expand-last"
             print(f"[DistillerModel] - Inter dim = {inter_dim}")
-            # self.output_layer = nn.Sequential(
-                # nn.Linear(final_emb_size, inter_dim * self.n_tasks),
-                # nn.GELU(),
-                # SplitLinear(inter_dim, self.n_tasks, config.final_dim),
-            # )
-            # self.output_layers = nn.ModuleDict({
-            #     teacher: nn.Sequential(
-            #         nn.Linear(final_emb_size, inter_dim * self.n_tasks // 2),  # Linear projection for each teacher
-            #         nn.GELU(),  # Non-linear activation
-            #         nn.LayerNorm(inter_dim * self.n_tasks // 2),  # Normalization for stability
-            #         Rearrange('b t d -> b d t'),  # Rearrange for Conv1d
-            #         # nn.Conv1d(inter_dim * self.n_tasks // 2 , inter_dim * self.n_tasks // 2, kernel_size=3, padding=1),  # 1D Convolution for temporal features
-            #         # nn.ReLU(),  # Activation after convolution
-            #         nn.Conv1d(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks // 2, kernel_size=3, padding=1),  # Another 1D convolution
-            #         nn.ReLU(),  # Activation after second convolution
-            #         Rearrange('b d t -> b t d'),  # Rearrange back to [B, T, D]
-            #         nn.Linear(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks),
-            #         nn.LayerNorm(inter_dim * self.n_tasks),  # Another layer normalization for stability
-            #         nn.GELU(),  # Non-linear activation
-            #         SplitLinear(inter_dim, self.n_tasks, config.final_dim)  # SplitLinear layer for output
-            #     ) for teacher in self.teacher_names  # For each teacher model
-            # })
-            # self.output_layers = nn.ModuleDict({
-            #     teacher: nn.Sequential(
-            #         nn.Linear(final_emb_size, inter_dim * self.n_tasks),  # Linear projection for each teacher
-            #         nn.GELU(),  # Non-linear activation
-            #         # Conditionally add a more complex model for 'sasst_frame' teacher
-            #         *(nn.LayerNorm(inter_dim * self.n_tasks),  # Normalization for stability
-            #         Rearrange('b t d -> b d t'),  # Rearrange for Conv1d
-            #         # nn.Conv1d(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks // 2, kernel_size=3, padding=1),
-            #         # nn.ReLU(),
-            #         nn.Conv1d(inter_dim * self.n_tasks, inter_dim * self.n_tasks, kernel_size=3, padding=1),
-            #         nn.ReLU(),
-            #         Rearrange('b d t -> b t d'),
-            #         # nn.Linear(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks),
-            #         nn.LayerNorm(inter_dim * self.n_tasks),
-            #         nn.GELU(),
-            #         SplitLinear(inter_dim, self.n_tasks, config.final_dim)
-            #         ) if teacher == 'ssast_frame' else (
-            #             SplitLinear(inter_dim, self.n_tasks, config.final_dim)
-            #         )
-            #     ) for teacher in self.teacher_names  # For each teacher model
-            # })
-            self.output_layers = nn.ModuleDict({
-                teacher: nn.Sequential(
-                    nn.Linear(final_emb_size, inter_dim * self.n_tasks // 2),  # Linear projection for each teacher
-                    nn.GELU(),  # Non-linear activation
-                    # Conditionally add a more complex model for 'sasst_frame' teacher
-                    nn.LayerNorm(inter_dim * self.n_tasks // 2),  # Normalization for stability
-                    Rearrange('b t d -> b d t'),  # Rearrange for Conv1d
-                    nn.Conv1d(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks // 2, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    Rearrange('b d t -> b t d'),
-                    nn.Linear(inter_dim * self.n_tasks // 2, inter_dim * self.n_tasks),
-                    nn.LayerNorm(inter_dim * self.n_tasks),
-                    nn.GELU(),
-                    SplitLinear(inter_dim, self.n_tasks, config.final_dim)
-                )
-                # ) if teacher == 'ssast_frame' else nn.Sequential(
-                #     nn.Linear(final_emb_size, inter_dim * self.n_tasks),  # Simpler model for other teachers
-                #     nn.GELU(),
-                #     SplitLinear(inter_dim, self.n_tasks, config.final_dim)
-                # )
-            for teacher in self.teacher_names  # For each teacher model
-            })
-            print(self.output_layers)
-            
+            self.output_layer = nn.Sequential(
+                nn.Linear(final_emb_size, inter_dim * self.n_tasks),
+                nn.GELU(),
+                SplitLinear(inter_dim, self.n_tasks, config.final_dim),
+            )
         elif config.out_layer_type in {"none", "self-hidden"}:
             self.output_layer = None
         else:
             raise NotImplementedError(f"Unknown out layer type {config.out_layer_type}")
 
-        # self.target_feature_sizes = {t: get_model_feature_size(t) for t in self.teacher_names}
-        # self.backbone_feature_size = [12, 2, 176, 768]
+        self.teacher_names = config.teacher_names
+        self.target_feature_sizes = {t: get_model_feature_size(t) for t in self.teacher_names}
+        self.backbone_feature_size = [12, 2, 176, 768]
         # self.feature_translators = nn.ModuleDict({
         #     'hubert_base': FeatureTranslator(feat_emb_dim, config.hubert_hidden_size),
         #     'mert_v0_public': FeatureTranslator(feat_emb_dim, config.mert_hidden_size),
         #     'ast': FeatureTranslator(feat_emb_dim, config.ast_hidden_size)
         # })
-        # if self.target_feature_sizes:
-        #     translator_kwargs = {} if config.translator_kwargs is None else config.translator_kwargs
-        #     translator_kwargs["input_size"] = self.backbone_feature_size
-        #     translator_kwargs["target_model_names"] = self.teacher_names
-        #     self.translator = build_feature_translator(config.translator_type, **translator_kwargs)
+        if self.target_feature_sizes:
+            translator_kwargs = {} if config.translator_kwargs is None else config.translator_kwargs
+            translator_kwargs["input_size"] = self.backbone_feature_size
+            translator_kwargs["target_model_names"] = self.teacher_names
+            self.translator = build_feature_translator(config.translator_type, **translator_kwargs)
 
     def forward_feature(self, wave, pad_mask):
         """Forward feature extractor"""
@@ -319,7 +251,7 @@ class MultiDistillerModel(nn.Module):
             feat_final = feat_final.unsqueeze(1)
         # feat_final: B x N x T x D or B x 1 x T x D
 
-        pad_mask = pad_mask.unsqueeze(1).expand(-1, n_sz, -1).reshape(b_sz * n_sz, t_sz) ### to mask on time dim,.
+        pad_mask = pad_mask.unsqueeze(1).expand(-1, n_sz, -1).reshape(b_sz * n_sz, t_sz)
         # BN x T
         feat_final = feat_final.reshape(b_sz * n_sz, t_sz, -1)
         # BN x T x D
@@ -334,40 +266,31 @@ class MultiDistillerModel(nn.Module):
             )
         else:
             hidden = self.encoder(feat_final)
-        
-        
+
         if not no_pred:
             if self.task_emb_type == "self-hidden":
                 pred = torch.stack([feat_final] + layer_hiddens, dim=1)
             else:
-                pred = {}
-                for teacher in self.teacher_names:
-                    pred[teacher] = self.output_layers[teacher](hidden).reshape(b_sz, t_sz, -1)
+                pred = self.output_layer(hidden).reshape(b_sz, n_sz, t_sz, -1)
             # B x N x T x D
         else:
             pred = None
 
         if (not no_pred) and self.task_emb_type == "expand-last":
             assert n_sz == 1, n_sz
-            for teacher in self.teacher_names:
-                pred[teacher] = (
-                    pred[teacher]
-                    .squeeze(1)
-                    .reshape(b_sz, t_sz, self.n_tasks, -1)
-                    .permute(0, 2, 1, 3)
-                )
+            pred = (
+                pred.squeeze(1)
+                .reshape(b_sz, t_sz, self.n_tasks, -1)
+                .permute(0, 2, 1, 3)
+            )
             # B x N x T x D
 
-        # translated_predictions = self.translator(pred, self.teacher_names) 
+        translated_predictions = self.translator(pred, self.teacher_names) 
 
         if get_hidden:
-            return feat, feat_final, pred, pad_mask, layer_hiddens
+            return feat, feat_final, translated_predictions, pad_mask, layer_hiddens
         else:
-            return feat, feat_final, pred, pad_mask
-        # if get_hidden:
-            # return feat, feat_final, pred, pad_mask, layer_hiddens
-        # else:
-            # return feat, feat_final, pred, pad_mask
+            return feat, feat_final, translated_predictions, pad_mask
 
     def cal_pad_mask(self, pad_mask, max_len):
         """Calculates pad mask after conv."""

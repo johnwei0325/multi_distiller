@@ -164,29 +164,13 @@ class WaveDataset(Dataset):
         if len(batch_x) > 1:
             self.X.append(batch_x)
 
-    # def _sample(self, x):
-    #     if self.sample_length <= 0:
-    #         return x
-    #     if len(x) < self.sample_length:
-    #         return x
-    #     idx = random.randint(0, len(x) - self.sample_length)
-    #     return x[idx : idx + self.sample_length]
-
-    def _sample(self, x, sample_rate):
-        if sample_rate != 16000:
-            adjusted_sample_length = int(self.sample_length * sample_rate / 16000)
-        else:
-            adjusted_sample_length = self.sample_length
-
-        if adjusted_sample_length <= 0:
+    def _sample(self, x):
+        if self.sample_length <= 0:
             return x
-
-        if len(x) < adjusted_sample_length:
+        if len(x) < self.sample_length:
             return x
-
-        idx = random.randint(0, len(x) - adjusted_sample_length)
-        return x[idx: idx + adjusted_sample_length]
-
+        idx = random.randint(0, len(x) - self.sample_length)
+        return x[idx : idx + self.sample_length]
 
     def __len__(self):
         return len(self.X)
@@ -194,6 +178,6 @@ class WaveDataset(Dataset):
     def collate_fn(self, items):
         items = items[0]  # hack bucketing
         assert (
-            len(items) == 5
+            len(items) == 4
         ), "__getitem__ should return (wave_input, wave_orig, wave_len, pad_mask)"
         return items
