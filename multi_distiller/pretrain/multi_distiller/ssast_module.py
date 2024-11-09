@@ -141,3 +141,4 @@ def calculate_stat(path_1, path_2):
     running_std = running_std
     print(running_mean, math.sqrt(running_std))
     return running_mean, running_std
+

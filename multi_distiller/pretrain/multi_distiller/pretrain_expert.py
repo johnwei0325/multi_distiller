@@ -11,20 +11,84 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pretrain.multi_distiller.dataset import OnlineWaveDataset
 from upstream.multi_distiller.model import MultiDistillerConfig, MultiDistillerModel
-from transformers import AutoModel, AutoConfig
-import torchaudio
+from pretrain.multi_distiller.convert_dict import convert_ssast_state_dict_to_astmodel
+from transformers import AutoModel, AutoConfig, ASTConfig
+import torchaudio 
 import torchaudio.transforms as transforms
 from transformers import ASTForAudioClassification
-from transformers import AutoProcessor, ASTModel
-
-
+# from transformers import AutoProcessor, ASTModel
+import pdb
+import os
+# from pretrain.multi_distiller.ssast_module import SSASTPredModule
+from pretrain.multi_distiller.audio import FeatureExtractor
+from pretrain.multi_distiller.ast_models import ASTModel
+from pretrain.multi_distiller.disable_dropout import disable_MERT_encoder_dropout, disable_AST_encoder_dropout, disable_SSAST_encoder_dropout
+os.environ["TORCH_HOME"] = "/mnt/data/ycevan/johnwei/"
 # from audiossl.models.atst.atst import ATST
-# from ......MERT.mert_fairseq.models.mert.mert_model import MERTConfig
+
+class TemporalAligner(nn.Module):
+    def __init__(self, max_length_in_seconds=10, input_sample_rate=16000, distilhubert_frame_shift=20, ssast_frame_shift=10):
+        """
+        TemporalAligner for aligning the time dimension of SSAST and distilHuBERT.
+        
+        Args:
+            max_length_in_seconds: Maximum length for SSAST (in seconds).
+            input_sample_rate: The sample rate of the input audio (default 16 kHz).
+            distilhubert_frame_shift: The frame shift (in ms) for distilHuBERT features.
+            ssast_frame_shift: The frame shift (in ms) for SSAST features.
+        """
+        super(TemporalAligner, self).__init__()
+
+        # Compute the number of samples for SSAST's max input length
+        self.max_length_in_samples = max_length_in_seconds * input_sample_rate
+        
+        # Frame shifts in samples for SSAST and distilHuBERT
+        self.distilhubert_frame_shift_samples = int((distilhubert_frame_shift / 1000) * input_sample_rate)
+        self.ssast_frame_shift_samples = int((ssast_frame_shift / 1000) * input_sample_rate)
+        
+        # Average pooling for temporal downsampling (matching distilHuBERT with SSAST)
+        self.temporal_pooling = nn.AvgPool1d(kernel_size=2, stride=2)
+    
+    def forward(self, ssast_features, distilhubert_features):
+        """
+        Align the SSAST and distilHuBERT features.
+        
+        Args:
+            ssast_features: The feature tensor from SSAST (batch, time, feature_dim).
+            distilhubert_features: The feature tensor from distilHuBERT (batch, time, feature_dim).
+            
+        Returns:
+            Aligned distilHuBERT features cropped and temporally downsampled.
+        """
+        # Step 1: Perform temporal downsampling of SSAST features
+        ssast_features_pooled = self.temporal_pooling(ssast_features.transpose(1, 2)).transpose(1, 2)
+        
+        # Step 2: Crop distilHuBERT features if they exceed the SSAST max length
+        # Determine the maximum number of frames SSAST can process (10 seconds)
+        max_frames_ssast = ssast_features_pooled.shape[1]
+        max_frames_distilhubert = distilhubert_features.shape[1]
+        
+        # Crop distilHuBERT features to match the SSAST max frames
+        if max_frames_distilhubert > max_frames_ssast:
+            distilhubert_features_cropped = distilhubert_features[:, :max_frames_ssast, :]
+        else:
+            distilhubert_features_cropped = distilhubert_features
+        
+        if max_frames_distilhubert < max_frames_ssast:
+            ssast_features_pooled = ssast_features_pooled[:, :max_frames_distilhubert, :]
+    
+        
+        return ssast_features_pooled, distilhubert_features_cropped
 
 def freeze_model(model):
     """Freeze all parameters in a model."""
     for param in model.parameters():
         param.requires_grad = False
+
+def unfreeze_model(model):
+    """Freeze all parameters in a model."""
+    for param in model.parameters():
+        param.requires_grad = True
 
 def remap_keys(state_dict, prefix):
     """Remap keys in the state_dict to match the model's expected structure."""
@@ -41,140 +105,41 @@ def remap_keys(state_dict, prefix):
         new_state_dict[f'{prefix}.{new_key}'] = value
     return new_state_dict
 
-def get_ATST_teacher_model(arch, ncrops, atst_model_path, target_device):
-    """Configure the ATST model by loading weights, disabling dropouts, and freezing the model."""
-    # Initialize the model
-    kwargs = {}  # Additional arguments if needed
-    teacher_3 = ATST(arch=arch, ncrops=ncrops, **kwargs)
+def average_weights(mapped_state_dicts):
+    """Averages the weights from multiple state_dicts."""
+    avg_dict = collections.OrderedDict()
 
-    # Load the full state dictionary from the file
-    full_state_dict = torch.load(atst_model_path, map_location='cpu')
+    keys = mapped_state_dicts[0].keys()
+    for key in keys:
+        weights = [sd[key] for sd in mapped_state_dicts]
+        avg_dict[key] = torch.mean(torch.stack(weights), dim=0)
 
-    # Extract the 'student' and 'teacher' state dictionaries
-    student_state_dict = full_state_dict.get('student', {})
-    teacher_state_dict = full_state_dict.get('teacher', {})
+    return avg_dict
 
-    # Remap keys
-    student_state_dict = remap_keys(student_state_dict, 'student')
-    teacher_state_dict = remap_keys(teacher_state_dict, 'teacher')
+def rename_attention_keys_mert(state_dict):
+    new_state_dict = {}
+    for key in state_dict.keys():
+        new_key = key
 
-    # Combine the remapped state dictionaries
-    combined_state_dict = {**student_state_dict, **teacher_state_dict}
+        # Map "attention" to "self_attn"
+        new_key = new_key.replace("attention.k_proj", "self_attn.k_proj")
+        new_key = new_key.replace("attention.v_proj", "self_attn.v_proj")
+        new_key = new_key.replace("attention.q_proj", "self_attn.q_proj")
+        new_key = new_key.replace("attention.out_proj", "self_attn.out_proj")
 
-    # Load the combined state dict into your model with strict=False to allow minor mismatches
-    try:
-        missing_keys, unexpected_keys = teacher_3.load_state_dict(combined_state_dict, strict=False)
-        print("Missing keys:", missing_keys)
-        print("Unexpected keys:", unexpected_keys)
-    except RuntimeError as e:
-        print(f"Error loading state dict: {e}")
+        # Map "layer_norm" to "self_attn_layer_norm"
+        new_key = new_key.replace("layer_norm", "self_attn_layer_norm")
 
-    # Move the model to the desired GPU
-    teacher_3.to(target_device)
+        # Map "feed_forward" to "fc1" and "fc2"
+        new_key = new_key.replace("feed_forward.intermediate_dense", "fc1")
+        new_key = new_key.replace("feed_forward.output_dense", "fc2")
 
-    # Disable dropouts in the student encoder's blocks
-    for block in teacher_3.student.encoder.blocks:
-        block.attn.attn_drop.p = 0.0
-        block.attn.proj_drop.p = 0.0
-        block.mlp.drop.p = 0.0
-        if hasattr(block, 'drop_path') and isinstance(block.drop_path, torch.nn.Dropout):
-            block.drop_path.p = 0.0
+        # Handle the final layer norm rename
+        new_key = new_key.replace("final_self_attn_layer_norm", "final_layer_norm")
 
-    # Disable dropouts in the teacher encoder's blocks
-    for block in teacher_3.teacher.encoder.blocks:
-        block.attn.attn_drop.p = 0.0
-        block.attn.proj_drop.p = 0.0
-        block.mlp.drop.p = 0.0
-        if hasattr(block, 'drop_path') and isinstance(block.drop_path, torch.nn.Dropout):
-            block.drop_path.p = 0.0
+        new_state_dict[new_key] = state_dict[key]
 
-    print("[ATST] - Disabled all dropouts in the encoder's blocks")
-
-    # Freeze the parameters of the teacher and student models
-
-    return teacher_3
-
-def disable_MERT_encoder_dropout(model):
-    """Disable all dropouts in the encoder layers of the model by setting their probabilities to 0.0."""
-
-    # Disable encoder layer dropout if available in config
-    if hasattr(model.config, 'encoder_layerdrop'):
-        model.config.encoder_layerdrop = 0.0  # Set encoder layer dropout to 0
-        print("[MERT] - Disabled all dropouts in the encoder's blocks via config")
-
-    # Iterate through all encoder layers and disable their dropouts by setting p=0.0
-    for layer in model.encoder.layers:
-        # Disable attention dropout
-        if hasattr(layer, 'attention') and hasattr(layer.attention, 'dropout'):
-            if isinstance(layer.attention.dropout, nn.Dropout):
-                layer.attention.dropout.p = 0.0  # Correctly set the probability to 0
-            elif isinstance(layer.attention.dropout, float):
-                layer.attention.dropout = 0.0  # Directly set the float value
-
-        # Disable intermediate and output dropouts in the feed-forward layer
-        if hasattr(layer, 'feed_forward'):
-            if hasattr(layer.feed_forward, 'intermediate_dropout'):
-                if isinstance(layer.feed_forward.intermediate_dropout, nn.Dropout):
-                    layer.feed_forward.intermediate_dropout.p = 0.0
-                elif isinstance(layer.feed_forward.intermediate_dropout, float):
-                    layer.feed_forward.intermediate_dropout = 0.0  # Directly set the float value
-
-            if hasattr(layer.feed_forward, 'output_dropout'):
-                if isinstance(layer.feed_forward.output_dropout, nn.Dropout):
-                    layer.feed_forward.output_dropout.p = 0.0
-                elif isinstance(layer.feed_forward.output_dropout, float):
-                    layer.feed_forward.output_dropout = 0.0  # Directly set the float value
-
-        # Disable general dropout in the layer if applicable
-        if hasattr(layer, 'dropout'):
-            if isinstance(layer.dropout, nn.Dropout):
-                layer.dropout.p = 0.0
-            elif isinstance(layer.dropout, float):
-                layer.dropout = 0.0  # Directly set the float value
-
-    print("[MERT] - Disabled all dropouts in the encoder's layers by setting p=0.0 where applicable")
-
-
-def disable_AST_encoder_dropout(model):
-    """Disable all dropouts in the encoder layers of the ASTModel by setting their probabilities to 0.0."""
-
-    # Disable encoder layer dropout if available in config
-    if hasattr(model.config, 'encoder_layerdrop'):
-        model.config.encoder_layerdrop = 0.0  # Set encoder layer dropout to 0
-
-    # Iterate through all encoder layers and disable their dropouts by setting p=0.0
-    for layer in model.encoder.layer:  # Access each ASTLayer in the encoder
-        # Disable attention dropout within ASTAttention
-        if hasattr(layer, 'attention') and hasattr(layer.attention, 'attention'):
-            attention = layer.attention.attention
-            if hasattr(attention, 'dropout') and isinstance(attention.dropout, nn.Dropout):
-                attention.dropout.p = 0.0  # Set attention dropout to 0.0
-
-        # Disable output dropout within ASTSelfOutput
-        if hasattr(layer, 'attention') and hasattr(layer.attention, 'output'):
-            output = layer.attention.output
-            if hasattr(output, 'dropout') and isinstance(output.dropout, nn.Dropout):
-                output.dropout.p = 0.0  # Set output dropout to 0.0
-
-        # Disable intermediate dropout within ASTIntermediate
-        if hasattr(layer, 'intermediate'):
-            intermediate = layer.intermediate
-            if hasattr(intermediate, 'intermediate_act_fn'):
-                act_fn = intermediate.intermediate_act_fn
-                if isinstance(act_fn, nn.Dropout):
-                    act_fn.p = 0.0  # Set intermediate activation dropout to 0.0
-
-        # Disable output dropout within ASTOutput
-        if hasattr(layer, 'output'):
-            output = layer.output
-            if hasattr(output, 'dropout') and isinstance(output.dropout, nn.Dropout):
-                output.dropout.p = 0.0  # Set output dropout to 0.0
-
-        # Disable any general dropout in the layer if applicable
-        if hasattr(layer, 'dropout') and isinstance(layer.dropout, nn.Dropout):
-            layer.dropout.p = 0.0
-
-    print("[AST] - Disabled all dropouts in the encoder's layers by setting p=0.0 where applicable")
+    return new_state_dict
 
 class UpstreamPretrainExpert(nn.Module):
     """
@@ -189,7 +154,8 @@ class UpstreamPretrainExpert(nn.Module):
         self.datarc = datarc
         self.device = device
         self.multi_gpu = multi_gpu
-
+        self.freeze = False
+        self.count_freeze = 0
         if type(upstream_config) == str:
             self.upstream_config = yaml.load(
                 open(upstream_config, "r"), Loader=yaml.FullLoader
@@ -211,7 +177,7 @@ class UpstreamPretrainExpert(nn.Module):
         print("[UpstreamPretrainExpert] - Initializing model...")
         model_config = MultiDistillerConfig(self.upstream_config["multi_distiller"])
         self.model = MultiDistillerForPretrain(
-            model_config, edict(self.upstream_config["teacher"])
+            self.datarc, model_config, edict(self.upstream_config["teacher"]) ### here we get the multidistiller part and the teacher part of the file
         )
 
         if self.multi_gpu:
@@ -279,15 +245,29 @@ class UpstreamPretrainExpert(nn.Module):
         Return:
             loss
         """
+        # if self.freeze:
+        #     self.count_freeze += 1
+        #     if self.count_freeze == 500:
+        #         unfreeze_model(self.model.distiller)
+        #         print('Unfreezed Student')
+        #         self.freeze = False
+        #         self.count_freeze = 0
 
-        wave_input, wave_orig, wave_len, pad_mask = data
+        # if global_step % 2500 == 0 and not self.freeze:
+        #     freeze_model(self.model.distiller)
+        #     unfreeze_model(self.model.distiller.translator)
+        #     print('Freezed Student')
+        #     self.freeze = True
+        
+        wave_input, wave_orig_16k, wave_orig_24k, wave_len, pad_mask = data
         wave_input = wave_input.to(self.device)
         wave_len = wave_len.to(self.device)
         pad_mask = pad_mask.type(wave_input.dtype).to(self.device)
 
-        loss, other_res = self.model(
+        loss, losses, other_res = self.model(
             wave_input,
-            wave_orig,
+            wave_orig_16k,
+            wave_orig_24k,
             wave_len,
             pad_mask,
             return_other=global_step % log_step == 0,
@@ -299,7 +279,7 @@ class UpstreamPretrainExpert(nn.Module):
                     value = float(value.mean().cpu().item())
                 records[key] = value
 
-        return loss, records
+        return loss, losses, records
 
     # interface
     def on_before_zero_grad(self):
@@ -336,25 +316,28 @@ class MultiDistillerForPretrain(nn.Module):
     Distiller for pretraining with flexible number of teacher models.
     """
 
-    def __init__(self, config: MultiDistillerConfig, teacher_config: edict):
+    def __init__(self, datarc: edict, config: MultiDistillerConfig, teacher_config: edict):
         super().__init__()
         self.config = config
+        self.datarc = datarc
         self.distiller = MultiDistillerModel(config)
+        #print(f"the distiller model arch inside MultiDistillerForPretrain is {self.distiller}")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.teacher_config = teacher_config
+        print(f"the teacher config inside MultiDistillerForPretrain is {self.teacher_config}")
         self.teachers = teacher_config.models  # Expecting a list of teacher model names
-
+        self.train_on_all_data = self.config.train_on_all_data
         # Dictionary to store teacher models and processors
         self.teacher_models = {}
         self.teacher_processors = {}
-
+        self.last_loss = []
         # Load teacher models based on self.teachers
         for model_name in self.teachers:
             if model_name == 'hubert_base':
                 teacher_1 = torch.hub.load("s3prl/s3prl",model_name).to(device)
                 if model_name.find("hubert") >= 0 or model_name.find("wav2vec2") >= 0:
                     teacher_1.model.encoder.layerdrop = 0
-                    print("[HuBERT] - Disabled all dropouts in the encoder's blocks")
+                    print("[HuBERT] - Disabled teacher's encoder layerdrop")
                 self.teacher_models[model_name] = teacher_1
             elif model_name == 'mert_v0_public':
                 temp_config = AutoConfig.from_pretrained("m-a-p/MERT-v0-public", trust_remote_code=True)
@@ -362,21 +345,23 @@ class MultiDistillerForPretrain(nn.Module):
                 teacher_2 = AutoModel.from_pretrained("m-a-p/MERT-v0-public", config=temp_config, trust_remote_code=True).to(device)
                 disable_MERT_encoder_dropout(teacher_2)
                 self.teacher_models[model_name] = teacher_2
-            elif model_name == 'ast':
-                temp_config = AutoConfig.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-                temp_config.output_hidden_states = True  # Enable output of hidden states
-                teacher_3 = ASTModel.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593", config=temp_config).to(device)
-                teacher_3_processor = AutoProcessor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-                disable_AST_encoder_dropout(teacher_3)
+            elif model_name == 'ssast_frame':
+                self.temporal_alignment = TemporalAligner()
+                teacher_3 = ASTModel(fshape=128, tshape=2, fstride=128, tstride=1, input_tdim=1024, input_fdim=128,
+                                  model_size='base', pretrain_stage=False, load_pretrained_mdl_path="/mnt/data/ycevan/johnwei/SSAST-Base-Frame-400.pth").to(device)
+                teacher_3_processor = FeatureExtractor(target_length=1024, apply_cmvn=False)
+                print(f"teacher_3_processor is {teacher_3_processor}")
+                disable_SSAST_encoder_dropout(teacher_3)
                 self.teacher_models[model_name] = teacher_3
                 self.teacher_processors[model_name] = teacher_3_processor
             else:
                 print(f"Warning: Unknown teacher model {model_name} specified.")
-
+            
+        
         # Freeze all teacher models
         for teacher in self.teacher_models.values():
             freeze_model(teacher)
-
+        
         # Initialize loss function
         if config.loss_type == "l1":
             self.loss_func = nn.L1Loss(reduction="none")
@@ -388,31 +373,194 @@ class MultiDistillerForPretrain(nn.Module):
         self.cosine_loss = config.cosine_loss
         if self.cosine_loss > 0:
             print("[DistillerForPretrain] - Enabled cosine similarity loss.")
+        
+        # Ensure that we can only load weights from hubert_base or mert_v0_public
+        model_to_initialize = self.config.initialize_from[0][0]
+        if model_to_initialize == 'ast':
+            raise AssertionError("[Error] Cannot initialize weights from 'ast' model. The student's architecture is compatible only with 'hubert_base' or 'mert_v0_public'.")
+        elif model_to_initialize == 'hubert_base':
+            print(f"Initializing student model from {model_to_initialize}...")
+            self.load_teacher_weights('hubert_base')
+        elif model_to_initialize == 'mert_v0_public':
+            print(f"Initializing student model from {model_to_initialize}...")
+            self.load_teacher_weights('mert_v0_public')
+        elif model_to_initialize == 'avg':
+            print(f"Initializing student model from {model_to_initialize}...")
+            self.load_teacher_weights('avg')
 
-        if config.init_teacher_conv_layers:
-            print("[DistillerForPretrain] - Initializing feature extractor from teacher")
-            self.distiller.feature_extractor.load_state_dict(
-                self.teacher_models['hubert_base'].model.feature_extractor.state_dict()
-            )
-            if self.distiller.post_extract_proj is not None:
+
+    def load_teacher_weights(self, teacher_name, device="cuda"):
+        """
+        Load the weights from a specified teacher model (hubert_base or mert_v0_public).
+        """
+        teacher_model = self.teacher_models.get(teacher_name)
+        if teacher_model is None:
+            print(f"teacher_name is {teacher_name} and self.config.initialize_from is {self.config.initialize_from[0]} ")
+            if teacher_name == self.config.initialize_from[0]:
+                if teacher_name == "mert_v0_public":
+                    temp_config = AutoConfig.from_pretrained("m-a-p/MERT-v0-public", trust_remote_code=True)
+                    temp_config.output_hidden_states = True  # Enable hidden states in the output
+                    teacher_model = AutoModel.from_pretrained("m-a-p/MERT-v0-public", config=temp_config, trust_remote_code=True).to(device)
+                    disable_MERT_encoder_dropout(teacher_model)
+                if teacher_name == "hubert_base":
+                    teacher_model = torch.hub.load("s3prl/s3prl","hubert_base").to(device)
+                    teacher_model.model.encoder.layerdrop = 0
+                    print("[HuBERT] - Disabled teacher's encoder layerdrop")
+            else:
+                raise ValueError(f"[Error] Teacher model '{teacher_name}' not found in the loaded teacher models.")
+            
+        if teacher_name == 'avg':
+            print(f"[DistillerForPretrain] - Loading weights from {teacher_name}")
+            
+            # Load weights for feature extractor
+            if self.config.init_teacher_conv_layers:
+                print(f"[DistillerForPretrain] - Initializing feature extractor from {teacher_name}")
+                self.distiller.feature_extractor.load_state_dict(
+                    teacher_model.model.feature_extractor.state_dict()
+                )
+                if self.distiller.post_extract_proj is not None:
+                    self.distiller.post_extract_proj.load_state_dict(
+                        teacher_model.model.post_extract_proj.state_dict()
+                    )
+            
+            # Load weights for encoder layers
+            if self.config.init_teacher_encoder_layers:
+                print(f"[DistillerForPretrain] - Initializing encoder from {teacher_name}")
+                self.distiller.encoder.pos_conv.load_state_dict(
+                    teacher_model.model.encoder.pos_conv.state_dict()
+                )
+                for l in range(self.config.encoder_layers):
+                    converted_state_dict_mert = rename_attention_keys_mert(self.teacher_models['mert_v0_public'].encoder.layers[l].state_dict())
+                    state_dict_hubert = self.teacher_models['hubert_base'].model.encoder.layers[l].state_dict()
+                    averaged_encoder = average_weights([converted_state_dict_mert, state_dict_hubert])
+                    student_encoder = self.distiller.encoder.layers[l].state_dict()
+                    for k, v in averaged_encoder.items():
+                        if k in student_encoder:
+                            student_encoder[k] = v
+                    self.distiller.encoder.layers[l].load_state_dict(
+                        student_encoder
+                    )
+        # Example: loading weights from hubert_base or mert_v0_public for feature extractor
+        if teacher_name == 'hubert_base':
+            print(f"[DistillerForPretrain] - Loading weights from {teacher_name}")
+            
+            # Load weights for feature extractor
+            if self.config.init_teacher_conv_layers:
+                print(f"[DistillerForPretrain] - Initializing feature extractor from {teacher_name}")
+                self.distiller.feature_extractor.load_state_dict(
+                    teacher_model.model.feature_extractor.state_dict()
+                )
+                if self.distiller.post_extract_proj is not None:
+                    self.distiller.post_extract_proj.load_state_dict(
+                        teacher_model.model.post_extract_proj.state_dict()
+                    )
+            
+            # Load weights for encoder layers
+            if self.config.init_teacher_encoder_layers:
+                print(f"[DistillerForPretrain] - Initializing encoder from {teacher_name}")
+                self.distiller.encoder.pos_conv.load_state_dict(
+                    teacher_model.model.encoder.pos_conv.state_dict()
+                )
+                for l in range(self.config.encoder_layers):
+                    self.distiller.encoder.layers[l].load_state_dict(
+                        teacher_model.model.encoder.layers[l].state_dict()
+                    )
+
+        if teacher_name == 'mert_v0_public':
+            print(f"[DistillerForPretrain] - Loading weights from {teacher_name}")
+            # Load weights for feature extractor
+            # Retrieve the state_dict of the MERT feature extractor
+            state_dict = teacher_model.feature_extractor.state_dict()
+
+            # Modify the keys to match distilHuBERT's expected layer names
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                # Convert "conv_layers.0.conv.weight" to "conv_layers.0.0.weight"
+                # Convert "conv_layers.0.layer_norm.weight" to "conv_layers.0.2.weight" (assuming layer_norm is at index 2)
+                if "conv_layers" in key:
+                    # Handle the convolution layers
+                    if "conv.weight" in key:
+                        new_key = key.replace("conv.weight", "0.weight")
+                    # Handle the normalization layers
+                    elif "layer_norm" in key:
+                        new_key = key.replace("layer_norm.weight", "2.weight").replace("layer_norm.bias", "2.bias")
+                    # Handle activation layers if needed (you can add this if distilHuBERT expects it)
+                    else:
+                        new_key = key
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value
+
+
+            if self.config.init_teacher_conv_layers:
+                print(f"[DistillerForPretrain] - Initializing feature extractor from {teacher_name}")
+                self.distiller.feature_extractor.load_state_dict(new_state_dict)
+
                 self.distiller.post_extract_proj.load_state_dict(
-                    self.teacher_models['hubert_base'].model.post_extract_proj.state_dict()
+                teacher_model.feature_projection.projection.state_dict()
                 )
+            
 
-        if config.init_teacher_encoder_layers:
-            print("[DistillerForPretrain] - Initializing encoder from teacher")
-            self.distiller.encoder.pos_conv.load_state_dict(
-                self.teacher_models['hubert_base'].model.encoder.pos_conv.state_dict()
-            )
-            for l in range(config.encoder_layers):
-                self.distiller.encoder.layers[l].load_state_dict(
-                    self.teacher_models['hubert_base'].model.encoder.layers[l].state_dict()
-                )
+            # Load weights for encoder layers
+            if self.config.init_teacher_encoder_layers:
+                # MERT has `conv`, `padding`, `activation`, distilHuBERT has indices `0`, `1`, `2` in a Sequential
+                mert_pos_conv = teacher_model.encoder.pos_conv_embed.state_dict()
+
+                # Decompose the weight_g and weight_v to get the actual weights
+                #conv_weight_g = mert_pos_conv['conv.weight_g']
+                #conv_weight_v = mert_pos_conv['conv.weight_v']
+                
+                #conv_weight = (conv_weight_g / conv_weight_v.norm(dim=1, keepdim=True)) * conv_weight_v # ->
+                # -> check: https://pytorch.org/docs/2.3/generated/torch.nn.utils.weight_norm.html
+
+
+                # Create a new state_dict for distilHuBERT by mapping the keys
+                # Create a new state_dict to map MERT's keys to distilHuBERT's keys
+                pos_conv_dict = {
+                    '0.bias': mert_pos_conv['conv.bias'],            # Mapping MERT's conv.bias to 0.bias
+                    '0.weight_g': mert_pos_conv['conv.weight_g'],    # Mapping MERT's weight_g to 0.weight_g
+                    '0.weight_v': mert_pos_conv['conv.weight_v']     # Mapping MERT's weight_v to 0.weight_v
+                }
+        
+
+                print(f"[DistillerForPretrain] - Loading encoder positional convolution from MERT")
+                self.distiller.encoder.pos_conv.load_state_dict(pos_conv_dict)
+                
+                print(f"[DistillerForPretrain] - Loading encoder layers from MERT")
+                for l in range(self.config.encoder_layers):
+                    # Mapping MERT's HubertEncoderLayer to distilHuBERT's TransformerSentenceEncoderLayer
+                    mert_encoder_layer = teacher_model.encoder.layers[l].state_dict()
+                    # Create a new state dict with mapped keys for distilHuBERT
+                    new_encoder_layer_dict = {}
+                    for key, value in mert_encoder_layer.items():
+                        # Rename attention block
+                        if 'attention.' in key:
+                            new_key = key.replace('attention.', 'self_attn.')
+                        # Rename layer_norm to self_attn_layer_norm
+                        elif 'layer_norm' in key and 'final_layer_norm' not in key:
+                            new_key = key.replace('layer_norm', 'self_attn_layer_norm')
+                        elif 'final_layer_norm' in key:
+                            new_key = key  # No changes for final_layer_norm
+                        # Rename feed forward layers
+                        elif 'feed_forward.intermediate_dense' in key:
+                            new_key = key.replace('feed_forward.intermediate_dense', 'fc1')
+                        elif 'feed_forward.output_dense' in key:
+                            new_key = key.replace('feed_forward.output_dense', 'fc2')
+                        else:
+                            new_key = key  # If no changes are needed, keep the key the same
+                        # Add the mapped key and value to the new dict
+                        new_encoder_layer_dict[new_key] = value
+
+                    self.distiller.encoder.layers[l].load_state_dict(new_encoder_layer_dict)
+
+
+
 
     def forward(
         self,
         wave_input: torch.Tensor,
-        wave_orig: list,
+        wave_orig_16k: list,
+        sample_domain: list,
         wave_len: torch.Tensor,
         pad_mask: torch.Tensor,
         return_other: bool = False,
@@ -421,26 +569,32 @@ class MultiDistillerForPretrain(nn.Module):
         Forward function.
         """
         feat, feat_final, pred, pad_mask = self.distiller(wave_input, pad_mask)
-
         teachers_hidden_states = {}
         with torch.no_grad():
-            wave_orig = [wave.to(wave_input.device) for wave in wave_orig]
-            if isinstance(wave_orig, list):
-                    max_length = max(wave.size(0) for wave in wave_orig)
-                    padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig]
-                    wave_orig = torch.stack(padded_wave_orig).to(wave_input.device)
+            wave_orig_16k = [wave.to(wave_input.device) for wave in wave_orig_16k]
+            if isinstance(wave_orig_16k, list):
+                    max_length = max(wave.size(0) for wave in wave_orig_16k)
+                    padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig_16k]
+                    wave_orig_16k = torch.stack(padded_wave_orig).to(wave_input.device)
+            # wave_orig_24k = [wave.to(wave_input.device) for wave in wave_orig_24k]
+            # if isinstance(wave_orig_24k, list):
+            #         max_length = max(wave.size(0) for wave in wave_orig_24k)
+            #         padded_wave_orig = [F.pad(wave, (0, max_length - wave.size(0))) for wave in wave_orig_24k]
+            #         wave_orig_24k = torch.stack(padded_wave_orig).to(wave_input.device)
             with torch.cuda.amp.autocast(False):
                 # Loop through the teacher models to gather hidden states
                 for model_name, teacher in self.teacher_models.items():
                     if model_name == 'hubert_base':
-                        teacher_hiddens = teacher(wave_orig)
+                        teacher_hiddens = teacher(wave_orig_16k)
                     elif model_name == 'mert_v0_public':
-                        teacher_hiddens = teacher(wave_orig)
-                    elif model_name == 'ast':
-                        inputs = self.teacher_processors[model_name](wave_orig.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-                        inputs = {key: value.to('cuda:0') for key, value in inputs.items()}
-                        teacher_hiddens = teacher(**inputs)
-
+                        teacher_hiddens = teacher(wave_orig_16k)
+                    elif model_name == 'ssast_frame':
+                        features = [self.teacher_processors[model_name](wav.unsqueeze(0)) for wav in wave_orig_16k]
+                        features = torch.stack(features, dim=0)
+                        teacher_hiddens, features = teacher(features)
+                        teacher_hiddens = torch.stack(teacher_hiddens)
+                        padded_hidden_states = F.pad(teacher_hiddens, (0, 0, 0, 0, 0, 0, 1, 0)) # Adds one dimension from 12 to 13 at the start
+                        teacher_hiddens = {"hidden_states": padded_hidden_states}
                     # Extract hidden states based on task embedding type
                     if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden"]:
                         teacher_hiddens = [
@@ -452,12 +606,13 @@ class MultiDistillerForPretrain(nn.Module):
         # Compute all objectives
         (
             total_loss,
+            total_losses,
             rec_loss,
             rec_layer_loss_dict,
             feat_pen,
             sim_loss,
             sim_layer_loss_dict,
-        ) = self.compute_loss(feat, pred, teachers_hidden_states, return_other)
+        ) = self.compute_loss(feat, pred, teachers_hidden_states, sample_domain, return_other)
 
         if return_other:
             with torch.no_grad():
@@ -509,9 +664,134 @@ class MultiDistillerForPretrain(nn.Module):
 
 
 
-        return total_loss, other_res
+        return total_loss, total_losses, other_res
 
-    def compute_loss(self, feat, pred, target, return_other=False):
+    def l2_normalize(self, tensor):
+        return tensor / tensor.norm(p=2, dim=-1, keepdim=True)
+
+    # def compute_loss(self, feat, pred, target, sample_domain, return_other=False):
+    #     """
+    #     Computes loss for multiple teachers.
+    #     Inputs:
+    #         feat: B x T x D
+    #         pred: Dict containing predictions from multiple teachers
+    #         target: Dict containing targets corresponding to each teacher
+    #         return_other: Flag to indicate if additional losses should be returned
+    #     """
+    #     # Initialize variables to accumulate losses
+    #     total_loss = 0
+    #     total_rec_loss = 0
+    #     total_sim_loss = 0
+    #     total_feat_pen = 0
+
+    #     rec_layer_loss_dict = {}
+    #     sim_layer_loss_dict = {}
+
+    #     #print(f"fix here for when you use more teachers....")
+
+    #     # Iterate over each teacher's predictions and targets
+    #     for teacher_key in target.keys(): ## on the meantime.... this needs to be fixed
+    #         # teacher_pred = pred    # [teacher_key]  # Prediction from the current teacher
+    #         teacher_pred = pred[teacher_key]
+    #         teacher_target = target[teacher_key]  # Target corresponding to the current teacher
+
+    #         if 'ssast_frame' in self.teacher_models:
+    #             aligned_preds = []  # To store aligned student features
+    #             aligned_targets = []  # To store aligned teacher features
+
+    #             for i in range(teacher_pred.shape[1]): ### do this outside... is better and more efficient, capitalize one of the for already being done outside...
+    #                 align_teacher, align_student = self.temporal_alignment(teacher_target[:,i,:,:], teacher_pred[:,i,:,:])
+    #                 # Append the aligned features to the lists
+    #                 aligned_preds.append(align_student.unsqueeze(1))  # Add back the layer dimension
+    #                 aligned_targets.append(align_teacher.unsqueeze(1))  # Add back the layer dimension
+
+    #             # Concatenate aligned layers back to 4D tensors (batch, layers, time, feature_dim)
+    #             teacher_pred = torch.cat(aligned_preds, dim=1)
+    #             teacher_target = torch.cat(aligned_targets, dim=1)
+            
+    #         # teacher_pred = self.l2_normalize(teacher_pred)
+    #         # teacher_target = self.l2_normalize(teacher_target)
+    #         # # Ensure shapes match
+    #         # print(teacher_key, ':', teacher_pred.shape, ' ', teacher_target.shape)
+    #         assert teacher_pred.shape == teacher_target.shape, (teacher_pred.shape, teacher_target.shape)
+
+    #         if self.train_on_all_data:
+    #             rec_loss = self.loss_func(teacher_pred, teacher_target)  # B x N x T x D
+    #             if teacher_key == 'ssast_frame':
+    #                 weighted_loss = rec_loss.mean() * 0.05
+    #             else:
+    #                 weighted_loss = rec_loss.mean()
+
+    #             total_rec_loss += weighted_loss
+    #         else:
+    #             temp_shape = (1, *teacher_target.shape[1:])
+    #             teacher_pred_for_spec_domain = []
+    #             teacher_target_for_spec_domain = []
+
+    #             for i, domain in enumerate(sample_domain):
+    #                 if domain == teacher_key:
+    #                     # Select the corresponding prediction and target
+    #                     teacher_pred_for_spec_domain.append(teacher_pred[i])  # B x N x T x D for sample i
+    #                     teacher_target_for_spec_domain.append(teacher_target[i])
+                
+    #             if len(teacher_pred_for_spec_domain) > 0:
+    #                 teacher_pred = torch.stack(teacher_pred_for_spec_domain)
+    #                 teacher_target = torch.stack(teacher_target_for_spec_domain)
+    #                 # Compute reconstruction loss
+    #                 rec_loss = self.loss_func(teacher_pred, teacher_target)  # B x N x T x D
+    #                 if teacher_key == 'ssast_frame':
+    #                     weighted_loss = rec_loss.mean() * 0.05
+    #                 else:
+    #                     weighted_loss = rec_loss.mean()
+    #             else:
+    #                 print(f"No matching predictions found for teacher: {teacher_key}")
+    #                 weighted_loss = 0
+    #                 rec_loss = torch.zeros(temp_shape)
+    #             total_rec_loss += weighted_loss
+
+    #         # Optionally compute layer-wise reconstruction loss
+    #         if return_other:
+    #             with torch.no_grad():
+    #                 if isinstance(rec_loss, torch.Tensor) and rec_loss.numel() > 0:
+    #                     # If it's a tensor with elements, calculate the mean loss
+    #                     rec_layer_loss = rec_loss.mean((0, 2, 3))
+    #                 if teacher_key == 'ssast_frame':
+    #                     rec_layer_loss = rec_layer_loss * 0.05
+    #                 else:
+    #                     rec_layer_loss = rec_layer_loss
+    #             rec_layer_loss_dict[teacher_key] = rec_layer_loss
+    #         else:
+    #             rec_layer_loss_dict[teacher_key] = None
+
+    #         # Compute cosine similarity loss if applicable
+    #         if self.cosine_loss > 0:
+    #             sim_loss = -F.logsigmoid(F.cosine_similarity(teacher_pred, teacher_target, dim=-1))  # B x N x T
+    #             total_sim_loss += sim_loss.mean()
+
+    #             # Optionally compute layer-wise similarity loss
+    #             if return_other:
+    #                 with torch.no_grad():
+    #                     sim_layer_loss = sim_loss.mean((0, 2))  # Per-layer similarity loss
+    #                 sim_layer_loss_dict[teacher_key] = sim_layer_loss
+    #             else:
+    #                 sim_layer_loss_dict[teacher_key] = None
+    #         else:
+    #             sim_layer_loss = 0
+    #             sim_layer_loss_dict[teacher_key] = None
+
+    #         # Compute feature penalty loss
+    #         feat_pen = feat.float().pow(2).mean()
+    #         total_feat_pen += feat_pen
+
+    #     # Sum up the total loss components
+    #     total_loss = (
+    #         total_rec_loss
+    #         + total_feat_pen * self.config.feat_pen_loss
+    #         + total_sim_loss * self.cosine_loss
+    #     )
+
+    #     return total_loss, total_rec_loss, rec_layer_loss_dict, total_feat_pen, total_sim_loss, sim_layer_loss_dict
+    def compute_loss(self, feat, pred, target, sample_domain, return_other=False):
         """
         Computes loss for multiple teachers.
         Inputs:
@@ -520,61 +800,107 @@ class MultiDistillerForPretrain(nn.Module):
             target: Dict containing targets corresponding to each teacher
             return_other: Flag to indicate if additional losses should be returned
         """
-        # Initialize variables to accumulate losses
+        # Initialize variables to accumulate overall losses
         total_loss = 0
         total_rec_loss = 0
         total_sim_loss = 0
         total_feat_pen = 0
+        teacher_total_losses = []  # List to store individual teacher's total loss for PCGrad
 
         rec_layer_loss_dict = {}
         sim_layer_loss_dict = {}
 
         # Iterate over each teacher's predictions and targets
-        for teacher_key in pred.keys():
-            teacher_pred = pred[teacher_key]  # Prediction from the current teacher
-            teacher_target = target[teacher_key]  # Target corresponding to the current teacher
+        for teacher_key in target.keys():
+            teacher_pred = pred[teacher_key]
+            teacher_target = target[teacher_key]
 
-            # Ensure shapes match
+            # Align predictions if using ssast_frame
+            if 'ssast_frame' in self.teacher_models:
+                aligned_preds = []
+                aligned_targets = []
+                for i in range(teacher_pred.shape[1]):
+                    align_teacher, align_student = self.temporal_alignment(teacher_target[:, i, :, :], teacher_pred[:, i, :, :])
+                    aligned_preds.append(align_student.unsqueeze(1))
+                    aligned_targets.append(align_teacher.unsqueeze(1))
+                teacher_pred = torch.cat(aligned_preds, dim=1)
+                teacher_target = torch.cat(aligned_targets, dim=1)
+
             assert teacher_pred.shape == teacher_target.shape, (teacher_pred.shape, teacher_target.shape)
 
-            # Compute reconstruction loss
-            rec_loss = self.loss_func(teacher_pred, teacher_target)  # B x N x T x D
-            total_rec_loss += rec_loss.mean()
+            # Calculate reconstruction loss
+            if self.train_on_all_data:
+                rec_loss = self.loss_func(teacher_pred, teacher_target)  # B x N x T x D
+                if teacher_key == 'ssast_frame':
+                    weighted_rec_loss = rec_loss.mean() * 0.05
+                else:
+                    weighted_rec_loss = rec_loss.mean()
+            else:
+                teacher_pred_for_spec_domain = []
+                teacher_target_for_spec_domain = []
+                for i, domain in enumerate(sample_domain):
+                    if domain == teacher_key:
+                        teacher_pred_for_spec_domain.append(teacher_pred[i])
+                        teacher_target_for_spec_domain.append(teacher_target[i])
 
-            # Optionally compute layer-wise reconstruction loss
+                if len(teacher_pred_for_spec_domain) > 0:
+                    teacher_pred = torch.stack(teacher_pred_for_spec_domain)
+                    teacher_target = torch.stack(teacher_target_for_spec_domain)
+                    rec_loss = self.loss_func(teacher_pred, teacher_target)
+                    if teacher_key == 'ssast_frame':
+                        weighted_rec_loss = rec_loss.mean() * 0.05
+                    else:
+                        weighted_rec_loss = rec_loss.mean()
+                else:
+                    print(f"No matching predictions found for teacher: {teacher_key}")
+                    weighted_rec_loss = 0
+                    rec_loss = torch.zeros_like(teacher_target)
+                    
+            total_rec_loss += weighted_rec_loss
+
+            # Calculate similarity loss if applicable
+            if self.cosine_loss > 0:
+                sim_loss = -F.logsigmoid(F.cosine_similarity(teacher_pred, teacher_target, dim=-1))
+                total_sim_loss += sim_loss.mean()
+            else:
+                sim_loss = 0
+
+            # Calculate feature penalty loss
+            feat_pen = feat.float().pow(2).mean()
+            total_feat_pen += feat_pen
+
+            # Calculate the total loss for this teacher and add it to the list
+            teacher_total_loss = (
+                weighted_rec_loss
+                + feat_pen * self.config.feat_pen_loss
+                + sim_loss.mean() * self.cosine_loss
+            )
+            teacher_total_losses.append(teacher_total_loss)
+
+            # Store layer-wise loss if return_other is True
             if return_other:
                 with torch.no_grad():
-                    rec_layer_loss = rec_loss.mean((0, 2, 3))  # Per-layer reconstruction loss
+                    rec_layer_loss = rec_loss.mean((0, 2, 3)) if rec_loss.numel() > 0 else 0
+                    if teacher_key == 'ssast_frame':
+                        rec_layer_loss *= 0.05
                 rec_layer_loss_dict[teacher_key] = rec_layer_loss
-            else:
-                rec_layer_loss_dict[teacher_key] = None
 
-            # Compute cosine similarity loss if applicable
-            if self.cosine_loss > 0:
-                sim_loss = -F.logsigmoid(F.cosine_similarity(teacher_pred, teacher_target, dim=-1))  # B x N x T
-                total_sim_loss += sim_loss.mean()
-
-                # Optionally compute layer-wise similarity loss
-                if return_other:
+                if self.cosine_loss > 0:
                     with torch.no_grad():
-                        sim_layer_loss = sim_loss.mean((0, 2))  # Per-layer similarity loss
+                        sim_layer_loss = sim_loss.mean((0, 2))
                     sim_layer_loss_dict[teacher_key] = sim_layer_loss
                 else:
                     sim_layer_loss_dict[teacher_key] = None
             else:
-                sim_layer_loss = 0
+                rec_layer_loss_dict[teacher_key] = None
                 sim_layer_loss_dict[teacher_key] = None
 
-            # Compute feature penalty loss
-            feat_pen = feat.float().pow(2).mean()
-            total_feat_pen += feat_pen
-
-        # Sum up the total loss components
+        # Sum up the total loss components for overall training
         total_loss = (
             total_rec_loss
             + total_feat_pen * self.config.feat_pen_loss
             + total_sim_loss * self.cosine_loss
         )
 
-        # print("=====================================", total_loss)
-        return total_loss, total_rec_loss, rec_layer_loss_dict, total_feat_pen, total_sim_loss, sim_layer_loss_dict
+        # Return individual teacher total losses for PCGrad, as well as other components
+        return total_loss, teacher_total_losses, total_rec_loss, rec_layer_loss_dict, total_feat_pen, total_sim_loss, sim_layer_loss_dict

@@ -173,3 +173,4 @@ def disable_SSAST_encoder_dropout(model):
             block.mlp.drop.p = 0.0
 
     print("[AST] - Disabled all applicable dropouts in the model.")
+

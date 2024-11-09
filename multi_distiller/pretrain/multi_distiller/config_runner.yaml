@@ -5,7 +5,7 @@ runner:
   gradient_accumulate_steps: 1
   num_workers: 24
   log_step: 50
-  save_step: 10000
+  save_step: 5000
   max_keep: 10
 
   fp16: true
@@ -20,9 +20,14 @@ optimizer:
 
 pretrain_expert:
   datarc:
+    data_stats:
+      wav_mean: -9.3908800007092e-13
+      wav_std: 0.16258983314037323
+      fbank_mean: -4.615277596840262
+      fbank_std: 3.360682519086203
+    train_batch_size: 24
     num_workers: 24
-    train_batch_size: 4
     max_timestep: 0
-    libri_root: /4TB/johnwei/ssl_project/dataset/LibriSpeech/
-    file_path: /4TB/johnwei/ssl_project/s3prl/s3prl/data/len_for_bucket
-    sets: ['train-clean-100']
+    libri_root: /
+    file_path: /mnt/data/ycevan/johnwei/s3prl/s3prl/data/len_for_bucket
+    sets: ['combined_dataset']

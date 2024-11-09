@@ -16,8 +16,7 @@ import numpy as np
 #-------------#
 from optimizers import get_optimizer, get_grouped_parameters
 from schedulers import get_scheduler
-
-
+from gradient_surgery.pcgrad import PCGrad
 ##########
 # RUNNER #
 ##########
@@ -120,10 +119,12 @@ class Runner():
         if amp:
             print('[Runner] - Enabled fp16 training')
             scaler = torch.cuda.amp.GradScaler()
-
+        surgery = self.config['runner'].get('surgery')
         # set optimizer
         model_params = [self.upstream.model]
         optimizer = self._get_optimizer(model_params)
+        if surgery:
+            optimizer = PCGrad(optimizer)
 
         # set scheduler
         scheduler = None
@@ -150,7 +151,7 @@ class Runner():
                     global_step = pbar.n + 1
 
                     with torch.cuda.amp.autocast(enabled=amp):
-                        loss, records = self.upstream(
+                        loss, losses, records = self.upstream(
                             data,
                             records=records,
                             global_step=global_step,
@@ -162,9 +163,20 @@ class Runner():
                     if self.args.multi_gpu:
                         loss = loss.sum()
                     if amp:
-                        scaler.scale(loss).backward()
+                        if surgery:
+                            scaled_losses = [loss / gradient_accumulate_steps for loss in losses]
+                            scaler.scale(scaled_losses[0]).backward(create_graph=True)
+                            for loss in scaled_losses[1:]:
+                                scaler.scale(loss).backward(create_graph=True)
+                            optimizer.pc_backward(scaled_losses)
+                        else:
+                            scaler.scale(loss).backward()
                     else:
-                        loss.backward()
+                        if surgery:
+                            accumulated_losses = [loss / gradient_accumulate_steps for loss in losses]
+                            optimizer.pc_backward(accumulated_losses)
+                        else:
+                            loss.backward()
 
                 except RuntimeError as e:
                     if 'CUDA out of memory' in str(e):
@@ -186,7 +198,7 @@ class Runner():
                     
                 # unscale
                 if amp:
-                    scaler.unscale_(optimizer)
+                    scaler.unscale_(optimizer.optimizer)
 
                 # gradient clipping
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.upstream.model.parameters(), self.config['runner']['gradient_clipping'])
