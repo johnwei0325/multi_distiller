@@ -225,8 +225,8 @@ class Runner():
                     # log loss
                     self.logger.add_scalar(f'{prefix}loss', all_loss, global_step=global_step)
                     # log lr
-                    if hasattr(optimizer, 'get_lr'):
-                        self.logger.add_scalar(f'{prefix}lr', optimizer.get_lr()[0], global_step=global_step)
+                    if hasattr(optimizer._optim, 'get_lr'):
+                        self.logger.add_scalar(f'{prefix}lr', optimizer._optim.get_lr()[0], global_step=global_step)
                     else:
                         self.logger.add_scalar(f'{prefix}lr', self.config['optimizer']['lr'], global_step=global_step)
                     # log norm
