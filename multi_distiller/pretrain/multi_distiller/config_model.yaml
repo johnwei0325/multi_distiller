@@ -45,17 +45,19 @@ multi_distiller:
   teacher_names: 
   - hubert_base
   - mert_v0_public
-  - ssast_frame
+
   translator_type: lconv
+  layerwise_translator: false
 
   translator_kwargs:
     hidden_size_factor: 1.0
+
+  train_on_all_data: false
 
 teacher:
   models:
     - hubert_base
     - mert_v0_public
-    - ssast_frame
 
   n_layers: 12
 
