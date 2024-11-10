@@ -9,6 +9,7 @@ runner:
   max_keep: 10
 
   fp16: true
+  surgery: true
 
 optimizer:
   name: AdamW_with_schedule
@@ -30,4 +31,4 @@ pretrain_expert:
     max_timestep: 0
     libri_root: /
     file_path: /mnt/data/ycevan/johnwei/s3prl/s3prl/data/len_for_bucket
-    sets: ['combined_dataset']
+    sets: ['humert']
