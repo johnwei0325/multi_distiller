@@ -17,6 +17,7 @@ import numpy as np
 from optimizers import get_optimizer, get_grouped_parameters
 from schedulers import get_scheduler
 from gradient_surgery.pcgrad import PCGrad
+
 ##########
 # RUNNER #
 ##########
@@ -198,7 +199,7 @@ class Runner():
                     
                 # unscale
                 if amp:
-                    scaler.unscale_(optimizer.optimizer)
+                    scaler.unscale_(optimizer._optim)
 
                 # gradient clipping
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.upstream.model.parameters(), self.config['runner']['gradient_clipping'])
@@ -207,7 +208,7 @@ class Runner():
 
                 # optimize
                 if amp:
-                    scaler.step(optimizer)
+                    scaler.step(optimizer._optim)
                     scaler.update()
                 elif not math.isnan(grad_norm):
                     optimizer.step()
@@ -251,7 +252,7 @@ class Runner():
                     check_ckpt_num(self.args.expdir)
 
                     all_states = {
-                        'Optimizer': optimizer.state_dict(),
+                        'Optimizer': optimizer._optim.state_dict(),
                         'Step': pbar.n,
                         'Args': self.args,
                         'Config': self.config,
