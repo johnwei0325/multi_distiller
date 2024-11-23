@@ -7,9 +7,12 @@ MODEL_FEATURE_SIZES = {
 }
 
 
+from typing import Tuple, Union
+import torch
+
 def get_model_feature_size(
     model_name: str, return_torch_size: bool = False
-) -> tuple[int, ...] | torch.Size:
+) -> Union[Tuple[int, ...], torch.Size]:
     """
     Get the size of queried model feature.
 
@@ -18,9 +21,9 @@ def get_model_feature_size(
         return_torch_size (bool): return torch.Size instead of python tuple. Defaults to False.
 
     Returns:
-        tuple[int, ...] | torch.Size: the size of the feature.
+        Union[Tuple[int, ...], torch.Size]: the size of the feature.
     """
-    size: tuple[int, ...] = MODEL_FEATURE_SIZES[model_name]
+    size: Tuple[int, ...] = MODEL_FEATURE_SIZES[model_name]
 
     if return_torch_size:
         size = torch.Size(size)
