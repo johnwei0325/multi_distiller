@@ -2,13 +2,13 @@
     Dataset for distiller
     Author: Heng-Jui Chang (https://github.com/vectominist)
 """
-
+import soundfile as sf
 import os
 import random
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-import torchaudio
+#import torchaudio
 from pretrain.bucket_dataset import WaveDataset
 import torch.nn.functional as F 
 
@@ -44,7 +44,10 @@ class OnlineWaveDataset(WaveDataset):
         # if self.libri_root is None:
         #     return torch.FloatTensor(np.load(os.path.join(self.root, feat_path)))
         try:
-            wav, sample_rate = torchaudio.load(feat_path)
+            wav, sample_rate = sf.read(feat_path)
+            wav = torch.from_numpy(wav)
+            
+            wav = wav.to(torch.float32)
         except Exception as e:
             print(f"Connection issue when loading file {feat_path}: {e}, retrying...")
         if wav.shape[0] == 2:  # Check if stereo (2 channels)
@@ -61,6 +64,7 @@ class OnlineWaveDataset(WaveDataset):
             target_sample_rate_16k = 16000  # Target sample rate (16 kHz)
             target_sample_rate_24k = 24000  # Target sample rate for x_batch_24k (24 kHz)
             sample_domain = []
+            # print(self.X)
             for x_file in self.X[index]:
                 # Load the waveform
                 # print(x_file)
@@ -74,7 +78,7 @@ class OnlineWaveDataset(WaveDataset):
                     print('Can not recognize data domain')
                 waveform, sample_rate = self._load_feat(x_file)
                 waveform = self._sample(waveform, sample_rate)
-
+                #waveform = waveform.type(torch.float64)
                 # Resample to 16 kHz if the sample rate is different
                 if sample_rate != target_sample_rate_16k:
                     resample_transform_16k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate_16k)
@@ -114,4 +118,3 @@ class OnlineWaveDataset(WaveDataset):
         except Exception as e:
             print(f"Error occurred at index {index}: {e}")
             raise e  # Re-raise the exception to stop the process
-
