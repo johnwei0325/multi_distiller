@@ -120,49 +120,115 @@ class WaveDataset(Dataset):
 
         # Read file
         self.root = file_path
+
+        # =============================================
+        # tables = [pd.read_csv(os.path.join(file_path, s + ".csv")) for s in sets]
+        # # self.table = pd.concat(tables, ignore_index=True).sort_values(
+        # #     by=["length"], ascending=False
+        # # )
+        # self.table = pd.concat(tables, ignore_index=True)
+        # print("[Dataset] - Training data from these sets:", str(sets))
+
+        # # Drop seqs that are too long
+        # if max_timestep > 0:
+        #     self.table = self.table[self.table.length < max_timestep]
+        # # Drop seqs that are too short
+        # if max_timestep < 0:
+        #     self.table = self.table[self.table.length > (-1 * max_timestep)]
+
+        # X = self.table["file_path"].tolist()
+        # random.shuffle(X)
+        # X_lens = self.table["length"].tolist()
+        # self.num_samples = len(X)
+        # print("[Dataset] - Number of individual training instances:", self.num_samples)
+
+        # # Use bucketing to allow different batch size at run time
+        # self.X = []
+        # batch_x, batch_len = [], []
+
+        # for x, x_len in zip(X, X_lens):
+        #     batch_x.append(x)
+        #     batch_len.append(x_len)
+
+        #     # Fill in batch_x until batch is full
+        #     if len(batch_x) == bucket_size:
+        #         print(max(batch_len))
+        #         # Half the batch size if seq too long
+        #         if (
+        #             (bucket_size >= 2)
+        #             and (max(batch_len) > HALF_BATCHSIZE_TIME)
+        #             and self.sample_length == 0
+        #         ):
+        #             self.X.append(batch_x[: bucket_size // 2])
+        #             self.X.append(batch_x[bucket_size // 2 :])
+        #         else:
+        #             self.X.append(batch_x)
+        #         batch_x, batch_len = [], []
+        # =============================================
         tables = [pd.read_csv(os.path.join(file_path, s + ".csv")) for s in sets]
-        self.table = pd.concat(tables, ignore_index=True).sort_values(
-            by=["length"], ascending=False
-        )
         print("[Dataset] - Training data from these sets:", str(sets))
-
-        # Drop seqs that are too long
-        if max_timestep > 0:
-            self.table = self.table[self.table.length < max_timestep]
-        # Drop seqs that are too short
-        if max_timestep < 0:
-            self.table = self.table[self.table.length > (-1 * max_timestep)]
-
-        X = self.table["file_path"].tolist()
-        X_lens = self.table["length"].tolist()
-        self.num_samples = len(X)
-        print("[Dataset] - Number of individual training instances:", self.num_samples)
-
-        # Use bucketing to allow different batch size at run time
+        
+        # Drop sequences based on max_timestep
+        for i, table in enumerate(tables):
+            if max_timestep > 0:
+                tables[i] = table[table.length < max_timestep]
+            elif max_timestep < 0:
+                tables[i] = table[table.length > (-1 * max_timestep)]
+        
+        # Initialize lists for storing batches
         self.X = []
-        batch_x, batch_len = [], []
+        self.num_samples = sum(len(table) for table in tables)
+        print("[Dataset] - Number of individual training instances:", self.num_samples)
+        
+        # Define per-dataset sample count for each batch
+        samples_per_dataset = bucket_size // len(sets)
+        print(samples_per_dataset)
+        # Prepare data for balanced batching
+        tables_shuffled = [table.sample(frac=1).reset_index(drop=True) for table in tables]  # Shuffle each dataset
+        self.X = []
+        data_indices = [0] * len(tables_shuffled)  # Track the current index for each dataset
 
-        for x, x_len in zip(X, X_lens):
-            batch_x.append(x)
-            batch_len.append(x_len)
+        while True:
+            batch_x, batch_len = [], []
 
-            # Fill in batch_x until batch is full
+            # Iterate over each table to pull `samples_per_dataset` entries
+            for i, table in enumerate(tables_shuffled):
+                start_idx = data_indices[i]
+                end_idx = start_idx + samples_per_dataset
+
+                # Ensure we don’t exceed the dataset length
+                if end_idx > len(table):
+                    end_idx = len(table)  # Adjust if the remaining samples are less than needed
+
+                # Add samples to the current batch
+                batch_x.extend(table["file_path"].iloc[start_idx:end_idx].tolist())
+                batch_len.extend(table["length"].iloc[start_idx:end_idx].tolist())
+
+                # Update the index for the next batch from this dataset
+                data_indices[i] = end_idx
+
+            # Add the completed batch to self.X, with sequence length handling
             if len(batch_x) == bucket_size:
-                # Half the batch size if seq too long
-                if (
-                    (bucket_size >= 2)
-                    and (max(batch_len) > HALF_BATCHSIZE_TIME)
-                    and self.sample_length == 0
-                ):
-                    self.X.append(batch_x[: bucket_size // 2])
-                    self.X.append(batch_x[bucket_size // 2 :])
+                # Split the batch if sequences are too long
+                random.shuffle(batch_x)
+                if (bucket_size >= 2) and (max(batch_len) > HALF_BATCHSIZE_TIME) and self.sample_length == 0:
+                    self.X.append(batch_x[:bucket_size // 2])
+                    self.X.append(batch_x[bucket_size // 2:])
                 else:
                     self.X.append(batch_x)
-                batch_x, batch_len = [], []
 
-        # Gather the last batch
-        if len(batch_x) > 1:
-            self.X.append(batch_x)
+            # Exit when all datasets are exhausted
+            if all(idx >= len(table) for idx, table in zip(data_indices, tables_shuffled)):
+                # If there are any remaining samples that don't fill a full batch, add them
+                # if batch_x:
+                #     self.X.append(batch_x)
+                break
+
+        print(len(self.X))
+
+        # # Gather the last batch
+        # if len(batch_x) > 1:
+        #     self.X.append(batch_x)
 
     # def _sample(self, x):
     #     if self.sample_length <= 0:
